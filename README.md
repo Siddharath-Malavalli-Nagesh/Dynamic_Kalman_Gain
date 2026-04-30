@@ -15,3 +15,5 @@ update line 115 if needed based on where you want to store .npz files
     val_np   = np.load('../Downloads/sensor_data/nclt_val.npz')
     test_np  = np.load('../Downloads/sensor_data/nclt_test.npz')
 ```
+
+trained model updated in root folder .pt file

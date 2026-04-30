@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #official nclt dataset downloader updated for Python3
 #we will be using the data from 2012-01-08
-#./downloader.py --date="2012-01-08" --all
+#python3 downloader.py --date "2012-01-08" --sen --gt --hokuyo
 
 #!/usr/bin/env python3
 

@@ -6,7 +6,7 @@ import numpy as np
 
 # Configuration
 DATE = "2012-01-08"
-BASE_DIR = "~/ros2_ws/src/Downloads"
+BASE_DIR = "Dynamic_Kalman_Gain/Downloads"
 IMU_FILE = os.path.join(BASE_DIR, "sensor_data", DATE, "ms25.csv")
 GT_FILE = os.path.join(BASE_DIR, "ground_truth", f"groundtruth_{DATE}.csv")
 

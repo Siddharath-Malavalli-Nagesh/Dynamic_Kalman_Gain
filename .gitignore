@@ -2,3 +2,4 @@ Downloads/ground_truth/
 Downloads/hokuyo_data/
 Downloads/sensor_data/
 Downloads/*.npz
+__pycache__/

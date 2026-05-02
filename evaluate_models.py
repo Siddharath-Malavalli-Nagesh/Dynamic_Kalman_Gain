@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from ekf import ExtendedKalmanFilter
 
 # ──────────────────────────────────────────────
-# Paths  (edit if needed)
+# Paths  
 # ──────────────────────────────────────────────
 KNET_WEIGHTS = "best_knet_nclt.pt"
 TEST_DATA    = "Downloads/nclt_test.npz"
@@ -30,7 +30,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ══════════════════════════════════════════════
-# Exact KalmanNet Architecture  (matches training script 1-to-1)
+# Exact KalmanNet Architecture  
 # ══════════════════════════════════════════════
 
 class KalmanNet(nn.Module):
@@ -111,7 +111,7 @@ def sanitize(arr: np.ndarray) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════
-# Metrics  (NumPy — mirrors training script style exactly)
+# Metrics  
 # ══════════════════════════════════════════════
 
 def compute_metrics(pred: np.ndarray, gt: np.ndarray, latency_ms: float) -> dict:
@@ -169,7 +169,7 @@ def run_kalmannet(model: KalmanNet, test_loader: DataLoader):
             total_time  += (t1 - t0)
             total_steps += x_batch.shape[0] * x_batch.shape[1]
 
-            all_preds.append(pred[:, 1:, :].cpu().numpy())    # exclude t=0
+            all_preds.append(pred[:, 1:, :].cpu().numpy())    
             all_trues.append(x_batch[:, 1:, :].cpu().numpy())
 
     preds = np.concatenate(all_preds, axis=0)   # (N, T-1, 6)

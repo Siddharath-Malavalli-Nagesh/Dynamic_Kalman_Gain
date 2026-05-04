@@ -128,5 +128,3 @@ All metrics are taken directly from evaluation outputs with consistent EKF basel
 - Slight degradation in precision vs KalmanNet
 
 ---
-
-# 8. Performance Trade-off Summary

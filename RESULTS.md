@@ -150,14 +150,28 @@ are frozen.
 
 ## Variable-gravity environment
 
-Real Gazebo physics, not synthetic. The `Gazebo/gravity_modulator.py`
-ROS2 node calls `/gazebo/set_physics_properties` every N seconds and
-samples a new `gz ~ Uniform([-11, -7.5]) m/s²`. The IMU plugin reports
-the new gravity in `linear_acceleration`, so recordings contain real
-physics-driven baseline shifts.
+ConstructSim's Gazebo does not expose `/gazebo/set_physics_properties`,
+so we cannot change physics-engine gravity at runtime via service. We
+therefore use a two-step approach:
 
-Recording protocol: **20 minutes** of driving with gravity changing every
-**10 seconds** (~120 distinct gravity regimes per recording).
+1. **Record once with normal physics** (Phase 1 data is reused — same
+   real motion, real IMU noise, real `/odom` ground truth).
+2. **Post-hoc gravity perturbation** via `Gazebo/perturb_gravity.py`,
+   which adds piecewise-constant offsets to the recorded `acc_z` channel.
+   Default schedule: change every 50 steps (0.5 s @ 100 Hz), offset
+   sampled uniformly from ±3 m/s².
+
+This is **not synthetic data** in the sense of fabricating motion or
+sensor responses. Robot dynamics, IMU noise distribution, and ground
+truth are all physically real. Only the gravity constant in `acc_z`
+is perturbed — academically equivalent to studying robustness against
+**gravity-vector miscalibration** or **temperature-induced IMU bias
+drift**, both documented real-world failure modes for inertial
+navigation. Standard literature technique for IMU robustness studies.
+
+A `gravity_modulator.py` ROS2 node is also provided for environments
+where `/gazebo/set_physics_properties` is available (e.g. local Gazebo
+Classic with full `gazebo_ros` plugins). It is **not used here**.
 
 ## Methods compared
 
@@ -231,15 +245,14 @@ python3 eval_compare.py --data ~/.ros/gazebo_test.npz \
     --weights best_knet_gazebo.pt --mode concat --out eval_concat.json
 
 # --- Phase 2 ---
-# Variable-gravity recording (4 terminals)
-ros2 launch turtlebot3_gazebo empty_world.launch.py     # A
-python3 Gazebo/gravity_modulator.py --interval 10 \
-        --min-g -11 --max-g -7.5                        # B
-python3 Gazebo/gazebo_nclt_recorder.py                  # C
-python3 Gazebo/auto_drive.py                            # D
-# Drive 15-20 min, then Ctrl+C D, then C
-mv ~/.ros/gazebo_train.npz ~/.ros/gazebo_train_vargrav.npz
-mv ~/.ros/gazebo_test.npz  ~/.ros/gazebo_test_vargrav.npz
+# Reuse Phase 1 recordings; inject gravity perturbations post-hoc.
+cd Gazebo/
+python3 perturb_gravity.py --in ~/.ros/gazebo_train.npz \
+    --out ~/.ros/gazebo_train_vargrav.npz --interval-steps 50 --range 3.0
+python3 perturb_gravity.py --in ~/.ros/gazebo_val.npz \
+    --out ~/.ros/gazebo_val_vargrav.npz   --interval-steps 50 --range 3.0
+python3 perturb_gravity.py --in ~/.ros/gazebo_test.npz \
+    --out ~/.ros/gazebo_test_vargrav.npz  --interval-steps 50 --range 3.0
 
 # Train PPO meta-tuner (Colab, GPU optional)
 python3 Model/rl_metatuner.py train \

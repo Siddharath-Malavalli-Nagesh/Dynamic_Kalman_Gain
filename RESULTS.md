@@ -1,24 +1,21 @@
-# Gazebo Adaptation Results — KalmanNet vs Classical Baselines (and RL Meta-Tuner)
+# Gazebo Adaptation Results — KalmanNet vs Classical Baselines
 
 Branch: `kalyani`
-Last updated: 2026-05-02
+Last updated: 2026-05-05
+
+> **Phase 2 (RL Meta-Tuner) results are documented separately in [`RL_RESULTS.md`](RL_RESULTS.md).**
 
 ---
 
 ## TL;DR
 
-> **Phase 1 — Static Gazebo:** Fine-tuned KalmanNet beats classical EKF
-> and Strapdown INS by **3.6× on position RMSE** over 56 s of continuous
-> IMU-only navigation, at 1.96 ms/step.
->
-> **Phase 2 — Variable Gravity (RL Meta-Tuner):** A small PPO policy
-> sitting on top of the frozen KalmanNet adapts the per-state gain online
-> when world gravity changes mid-run. **Numbers below — fill in after
-> Colab training and ConstructSim eval.**
+> Fine-tuned KalmanNet beats classical EKF and Strapdown INS by
+> **3.6× on position RMSE** (30.6 m vs 109.5 m) and **4.7× on velocity
+> RMSE** (1.08 vs 5.02 m/s) over 56 s of continuous IMU-only navigation
+> in Gazebo, at 1.96 ms/step inference cost — well inside the 10 ms
+> real-time budget at 100 Hz IMU.
 
 ---
-
-# Phase 1 — Static Gazebo (NCLT KalmanNet adapted to TurtleBot3)
 
 ## Setup
 
@@ -81,7 +78,7 @@ weakness. Not the regime where filtering matters.
 | `vy` (m/s) | **0.68** | 0.44 | 0.44 | EKF marginally better |
 | `vz` (m/s) | **1.66** | 8.67 | 8.67 | KalmanNet **5.2×** — same gravity story |
 
-## Phase 1 interpretation
+## Interpretation
 
 KalmanNet's two structural wins are **gravity handling** (it learned during
 pretraining that `acc_z ≈ 9.81` should not contribute to vertical
@@ -94,190 +91,44 @@ Raw outputs: [`eval_chunked.json`](eval_chunked.json),
 
 ---
 
-# Phase 2 — Variable Gravity with RL Meta-Tuner
+## Limitations
 
-## Motivation
-
-The fine-tuned KalmanNet is **rigid**: it was trained on Earth gravity
-(`gz = -9.81 m/s²`) and has no mechanism to recalibrate if the
-environment changes. A real deployment can't assume gravity is constant
-(think: robot operating on a sloped surface where the body-frame
-"vertical" component shifts, or an aerial vehicle in a different
-atmosphere, or — for stress-testing — explicit gravity perturbations).
-
-To make the filter **adaptive**, we add a small PPO meta-tuner that
-observes the innovation signal and outputs per-state-dim multiplicative
-adjustments to KalmanNet's learned gain `K`. Base KalmanNet weights
-are frozen.
-
-## Architecture
-
-```
-              IMU obs y_t
-                  │
-                  ▼
-          ┌──────────────────┐
-          │   KalmanNet      │  (frozen)
-          │   computes K_t   │
-          └──────────────────┘
-                  │
-       ┌──────────┴──────────┐
-       │                     │
-       ▼                     ▼
-   innovation        K_t (learned gain)
-       │                     │
-       ▼                     │
-  ┌───────────┐              │
-  │ PPO MLP   │  s_t ∈ ℝ^6  │
-  │  16-16    │──────────┐   │
-  └───────────┘          │   │
-                         ▼   ▼
-                    K_final = K_t * s_t
-                         │
-                         ▼
-                     x_post
-```
-
-| | |
-|---|---|
-| Action space | `Box(-1, 1, shape=(6,))` → gain scaler `1.0 + 0.5·a` ∈ [0.5, 1.5] |
-| Observation | innovation (3) + ema innov magnitude (1) + posterior |v| (1) + last action (6) = 11 dims |
-| Reward | `-mean((x_post - x_gt)²)` per step |
-| Episode | one 200-step training sequence |
-| Algorithm | PPO (stable-baselines3) |
-| Policy | tiny MLP `16 → 16 → 6` (~500 params), suitable for edge |
-| Training compute | ~100k env steps, ~10–15 min on Colab CPU |
-
-## Variable-gravity environment
-
-ConstructSim's Gazebo does not expose `/gazebo/set_physics_properties`,
-so we cannot change physics-engine gravity at runtime via service. We
-therefore use a two-step approach:
-
-1. **Record once with normal physics** (Phase 1 data is reused — same
-   real motion, real IMU noise, real `/odom` ground truth).
-2. **Post-hoc gravity perturbation** via `Gazebo/perturb_gravity.py`,
-   which adds piecewise-constant offsets to the recorded `acc_z` channel.
-   Default schedule: change every 50 steps (0.5 s @ 100 Hz), offset
-   sampled uniformly from ±3 m/s².
-
-This is **not synthetic data** in the sense of fabricating motion or
-sensor responses. Robot dynamics, IMU noise distribution, and ground
-truth are all physically real. Only the gravity constant in `acc_z`
-is perturbed — academically equivalent to studying robustness against
-**gravity-vector miscalibration** or **temperature-induced IMU bias
-drift**, both documented real-world failure modes for inertial
-navigation. Standard literature technique for IMU robustness studies.
-
-A `gravity_modulator.py` ROS2 node is also provided for environments
-where `/gazebo/set_physics_properties` is available (e.g. local Gazebo
-Classic with full `gazebo_ros` plugins). It is **not used here**.
-
-## Methods compared
-
-| Method | Description |
-|---|---|
-| **EKF** | Same 9-D augmented-state EKF as Phase 1. No gravity awareness. |
-| **KalmanNet (frozen)** | Phase 1 best, but never seen variable gravity. |
-| **KalmanNet + RL Meta-Tuner** | This work. Frozen KalmanNet + PPO MLP. |
-
-## Results — variable gravity (concat mode, 56 s+)
-
-> **TODO**: fill in after Colab training and ConstructSim eval.
-> Run `python3 Model/eval_metatuner.py --data gazebo_test_vargrav.npz
-> --weights best_knet_gazebo.pt --policy meta_tuner_ppo.zip` and copy
-> the table from `rl_eval.json`.
-
-| Metric | EKF | KalmanNet (frozen) | KalmanNet + RL | RL wins by |
-|---|---:|---:|---:|---:|
-| RMSE position (m) | TBD | TBD | TBD | TBD |
-| MAE position (m) | TBD | TBD | TBD | TBD |
-| RMSE velocity (m/s) | TBD | TBD | TBD | TBD |
-| Inlier precision <1 m | TBD | TBD | TBD | TBD |
-| Latency (ms/step) | TBD | TBD | TBD | TBD |
-
-### Per-state RMSE
-
-| State | EKF | KalmanNet | KalmanNet + RL |
-|---|---:|---:|---:|
-| `px` (m) | TBD | TBD | TBD |
-| `py` (m) | TBD | TBD | TBD |
-| `pz` (m) | TBD | TBD | TBD |
-| `vx` (m/s) | TBD | TBD | TBD |
-| `vy` (m/s) | TBD | TBD | TBD |
-| `vz` (m/s) | TBD | TBD | TBD |
-
-## Phase 2 interpretation (template)
-
-**Expected outcome:** Frozen KalmanNet degrades on variable gravity
-(particularly on `pz`/`vz` since gravity changes directly affect `acc_z`).
-RL Meta-Tuner reduces that degradation by adjusting the gain to reject
-the spurious vertical signal during gravity transitions. Latency cost is
-small (~0.1 ms/step extra for the 16-16 MLP).
-
-If RL meta-tuner does not improve over frozen KalmanNet, candidate
-explanations to investigate:
-1. PPO hasn't learned a useful policy → train longer (300k+ steps),
-   try larger policy net, increase exploration.
-2. Action space is too restrictive (gain ∈ [0.5, 1.5]) → widen.
-3. Observation space lacks the necessary signal → add longer history,
-   add Q-values or recurrent features.
-
----
+1. **Single environment.** Recorded only in Gazebo `empty_world`. No
+   evaluation on real hardware.
+2. **Synthetic IMU.** Gazebo's IMU plugin produces clean Gaussian
+   noise. Real IMUs have bias drift, scale-factor errors, temperature
+   dependence — exactly the regime where KalmanNet's learned
+   corrections should help even more.
+3. **Modest training data.** Only 129 training sequences (~26 s
+   equivalent). NCLT priors carry most of the model; fine-tune is a
+   light touch. More Gazebo data would likely improve the gap further.
+4. **Both filters fail inlier precision <1 m at 56 s.** Without any
+   absolute position observation (no GPS, no wheel odom corrections),
+   IMU-only navigation diverges over time. The result shows
+   *relative* improvement; absolute accuracy still requires sensor
+   fusion.
+5. **EKF px result (3.8 m) is fragile.** The bias-correction window
+   happened to absorb early forward motion. On a different recording
+   start condition this could flip.
 
 ## Reproducing
 
 ```bash
-# --- Phase 1 ---
+# Record
 ros2 launch turtlebot3_gazebo empty_world.launch.py     # terminal A
 python3 Gazebo/gazebo_nclt_recorder.py                  # terminal B
 python3 Gazebo/auto_drive.py                            # terminal C
 # Ctrl+C C, then B → ~/.ros/gazebo_*.npz
 
+# Fine-tune (Colab)
 cd Model/
 python3 finetune_gazebo.py --data-dir ~/.ros \
     --init-weights best_knet_nclt.pt \
     --out-weights best_knet_gazebo.pt --epochs 30 --lr 1e-4
 
+# Evaluate
 python3 eval_compare.py --data ~/.ros/gazebo_test.npz \
     --weights best_knet_gazebo.pt --mode chunked --out eval_chunked.json
 python3 eval_compare.py --data ~/.ros/gazebo_test.npz \
     --weights best_knet_gazebo.pt --mode concat --out eval_concat.json
-
-# --- Phase 2 ---
-# Reuse Phase 1 recordings; inject gravity perturbations post-hoc.
-cd Gazebo/
-python3 perturb_gravity.py --in ~/.ros/gazebo_train.npz \
-    --out ~/.ros/gazebo_train_vargrav.npz --interval-steps 50 --range 3.0
-python3 perturb_gravity.py --in ~/.ros/gazebo_val.npz \
-    --out ~/.ros/gazebo_val_vargrav.npz   --interval-steps 50 --range 3.0
-python3 perturb_gravity.py --in ~/.ros/gazebo_test.npz \
-    --out ~/.ros/gazebo_test_vargrav.npz  --interval-steps 50 --range 3.0
-
-# Train PPO meta-tuner (Colab, GPU optional)
-python3 Model/rl_metatuner.py train \
-    --weights best_knet_gazebo.pt \
-    --data    gazebo_train_vargrav.npz \
-    --steps   100000 \
-    --out     meta_tuner_ppo.zip
-
-# Evaluate
-python3 Model/eval_metatuner.py \
-    --data    gazebo_test_vargrav.npz \
-    --weights best_knet_gazebo.pt \
-    --policy  meta_tuner_ppo.zip \
-    --mode    concat \
-    --out     rl_eval.json
 ```
-
-## Limitations
-
-(Phase 1 limitations as before, plus Phase 2:)
-
-6. **PPO trained offline on recorded sequences**, not in true closed loop
-   with Gazebo. The action affects the state estimate but not the robot
-   trajectory, so there's no feedback loop to learn around. Acceptable
-   for a meta-tuner (it doesn't change motion), but worth noting.
-7. **Gravity range** explored is `[-11, -7.5] m/s²`. Wider ranges or
-   different perturbations (bias drift, IMU misalignment) would test
-   generalization further.

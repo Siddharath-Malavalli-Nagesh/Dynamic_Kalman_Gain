@@ -1,14 +1,28 @@
 """
 evaluate_models.py
 ------------------
-Compares KalmanNet and an Extended Kalman Filter on the NCLT test set.
+Three-way comparison: KalmanNet (teacher) | KalmanNet Student (shadow) | EKF
 
-Usage:
-    python evaluate_models.py
+Metrics (per model):
+    Position (px, py, pz):
+        MSE, RMSE, RMSE per axis (x/y/z), MAE, MAE per axis,
+        error variance, inlier precision (<1 m), % pos error
+    Velocity (vx, vy, vz):
+        MSE, RMSE, RMSE per axis (vx/vy/vz), MAE, MAE per axis,
+        error variance
+    Full state:
+        MSE
 
-Expected files in the working directory (or adjust paths below):
-    best_knet_nclt.pt   – saved KalmanNet weights  (state-dict)
-    nclt_test.npz       – test split  (keys: 'x' [B,T,6], 'y' [B,T,3])
+Latency (step-wise, no batching):
+    CPU : all three models
+    GPU : KalmanNet + Student only (EKF is always CPU)
+
+Expected files:
+    best_knet_nclt.pt      KalmanNet teacher weights
+    best_student_nclt.pt   Student weights
+    nclt_test.npz          keys: 'x' (N,T,6), 'y' (N,T,3)
+    ekf.py                 ExtendedKalmanFilter
+    kalmannet_student.py   KalmanNetStudent
 """
 
 import time
@@ -18,22 +32,29 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ekf import ExtendedKalmanFilter
-
+from kalmannet_student import KalmanNetStudent
+import torch.nn.functional as F
 # ──────────────────────────────────────────────
-# Paths  
+# Paths / constants
 # ──────────────────────────────────────────────
-KNET_WEIGHTS = "best_knet_nclt.pt"
-TEST_DATA    = "Downloads/nclt_test.npz"
-BATCH_SIZE   = 32
+KNET_WEIGHTS    = "best_knet_nclt.pt"
+STUDENT_WEIGHTS = "best_student_nclt.pt"
+TEST_DATA       = "Downloads/nclt_test.npz"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# How many sequences to use for step-wise latency timing.
+# Reduce if CPU timing is too slow on large test sets.
+LATENCY_N_SEQ = 20
+
+DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+HAS_CUDA = torch.cuda.is_available()
 
 
 # ══════════════════════════════════════════════
-# Exact KalmanNet Architecture  
+# KalmanNet teacher — exact architecture match
 # ══════════════════════════════════════════════
 
 class KalmanNet(nn.Module):
+
     def __init__(self, m=6, n=3, N_rnn=32):
         super().__init__()
         self.m, self.n, self.N_rnn = m, n, N_rnn
@@ -57,13 +78,15 @@ class KalmanNet(nn.Module):
         nn.init.zeros_(self.H.bias)
 
         dt = 0.01
-        F = torch.eye(m)
+        F  = torch.eye(m)
         F[0, 3] = dt; F[1, 4] = dt; F[2, 5] = dt
         self.F = nn.Parameter(F, requires_grad=False)
 
-    def forward(self, Yseq, x0):
+    def forward(self, Yseq: torch.Tensor, x0: torch.Tensor):
         B, T, _ = Yseq.shape
         device  = Yseq.device
+
+        x0 = x0.view(-1, self.m)[:B]
 
         x_post = torch.zeros(B, T, self.m, device=device)
         x_post[:, 0, :] = x0
@@ -78,7 +101,7 @@ class KalmanNet(nn.Module):
             delta_y = y - y_prev
 
             e_post = (x_post[:, t - 1, :] - x_post[:, t - 2, :]
-                      if t > 1 else torch.zeros_like(x_post[:, 0, :]))
+                      if t > 1 else torch.zeros(B, self.m, device=device))
 
             h_Q     = self.GRU_Q(delta_y, h_Q)
             h_Sigma = self.GRU_Sigma(e_post, h_Sigma)
@@ -86,7 +109,6 @@ class KalmanNet(nn.Module):
 
             feat = torch.cat([h_Q, h_Sigma, h_S, y, x_post[:, t - 1, :]], dim=1)
             feat = self.norm(feat)
-
             feat = torch.relu(self.fc1(feat))
             feat = torch.relu(self.fc2(feat))
             K    = self.fc3(feat).view(B, self.m, self.n)
@@ -95,47 +117,39 @@ class KalmanNet(nn.Module):
             y_pred  = self.H(x_prior)
             innov   = y - y_pred
 
-            correction      = torch.bmm(K, innov.unsqueeze(2)).squeeze(2)
-            x_post[:, t, :] = x_prior + correction
+            x_post[:, t, :] = x_prior + torch.bmm(K, innov.unsqueeze(2)).squeeze(2)
 
-        return x_post   # (B, T, 6) — index 0 is x0, predictions start at 1
+        # Returns plain tensor (no gains needed at eval time)
+        return x_post   # (B, T, 6)
 
 
 # ══════════════════════════════════════════════
-# Data helpers
+# Data helper
 # ══════════════════════════════════════════════
 
-def sanitize(arr: np.ndarray) -> np.ndarray:
+def _sanitize(arr: np.ndarray) -> np.ndarray:
     arr[np.isinf(arr)] = np.nan
     return np.nan_to_num(arr, nan=0.0)
 
 
 # ══════════════════════════════════════════════
-# Metrics  
+# Metrics — full per-dimension breakdown
 # ══════════════════════════════════════════════
-
-# REPLACE the entire compute_metrics function with:
 
 def compute_metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
     """
     Args:
-        pred / gt : (N, T, 6) — t=1…T-1 already excluded by caller
-    Returns separate metrics for position, velocity, and full state.
-    Latency is computed and added separately by the caller.
+        pred, gt : (N, T, 6)  t=1..T-1  (t=0 excluded by caller)
+    Returns complete metric dict. Latency added separately.
     """
-    error     = pred - gt                           # (N, T, 6)
-    pos_error = error[:, :, :3]                     # (N, T, 3)
-    vel_error = error[:, :, 3:]                     # (N, T, 3)
+    error     = pred - gt
+    pos_error = error[:, :, :3]   # (N, T, 3)
+    vel_error = error[:, :, 3:]   # (N, T, 3)
 
-    pos_dist  = np.linalg.norm(pos_error, axis=2)  # (N, T)
-    vel_dist  = np.linalg.norm(vel_error, axis=2)  # (N, T)
+    pos_dist = np.linalg.norm(pos_error, axis=2)   # (N, T)
+    vel_dist = np.linalg.norm(vel_error, axis=2)
 
-    # Position
-    mse_pos       = float(np.mean(pos_error ** 2))
-    rmse_pos      = float(np.sqrt(np.mean(pos_dist ** 2)))
-    mae_pos       = float(np.mean(pos_dist))
-    var_pos       = float(np.var(pos_dist))
-    precision_1m  = float(np.mean(pos_dist < 1.0) * 100)
+    # Per-dimension position
     rmse_px = float(np.sqrt(np.mean(pos_error[:, :, 0] ** 2)))
     rmse_py = float(np.sqrt(np.mean(pos_error[:, :, 1] ** 2)))
     rmse_pz = float(np.sqrt(np.mean(pos_error[:, :, 2] ** 2)))
@@ -143,257 +157,292 @@ def compute_metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
     mae_py  = float(np.mean(np.abs(pos_error[:, :, 1])))
     mae_pz  = float(np.mean(np.abs(pos_error[:, :, 2])))
 
-    # Velocity
-    mse_vel  = float(np.mean(vel_error ** 2))
-    rmse_vel = float(np.sqrt(np.mean(vel_dist ** 2)))
-    mae_vel  = float(np.mean(vel_dist))
-    var_vel  = float(np.var(vel_dist))
+    # Per-dimension velocity
     rmse_vx = float(np.sqrt(np.mean(vel_error[:, :, 0] ** 2)))
     rmse_vy = float(np.sqrt(np.mean(vel_error[:, :, 1] ** 2)))
     rmse_vz = float(np.sqrt(np.mean(vel_error[:, :, 2] ** 2)))
     mae_vx  = float(np.mean(np.abs(vel_error[:, :, 0])))
     mae_vy  = float(np.mean(np.abs(vel_error[:, :, 1])))
     mae_vz  = float(np.mean(np.abs(vel_error[:, :, 2])))
+
+    # Grouped position
+    mse_pos      = float(np.mean(pos_error ** 2))
+    rmse_pos     = float(np.sqrt(np.mean(pos_dist ** 2)))
+    mae_pos      = float(np.mean(pos_dist))
+    var_pos      = float(np.var(pos_dist))
+    precision_1m = float(np.mean(pos_dist < 1.0) * 100)
+    gt_pos_norm  = np.mean(np.linalg.norm(gt[:, :, :3], axis=2)) + 1e-8
+    pct_error    = float(mae_pos / gt_pos_norm * 100)
+
+    # Grouped velocity
+    mse_vel  = float(np.mean(vel_error ** 2))
+    rmse_vel = float(np.sqrt(np.mean(vel_dist ** 2)))
+    mae_vel  = float(np.mean(vel_dist))
+    var_vel  = float(np.var(vel_dist))
+
     # Full state
     mse_full = float(np.mean(error ** 2))
 
-    # % position error — stable, relative to mean GT position magnitude
-    gt_pos_norm = np.mean(np.linalg.norm(gt[:, :, :3], axis=2)) + 1e-8
-    pct_error   = float(mae_pos / gt_pos_norm * 100)
-
     return dict(
-        # position
-        mse_pos      = mse_pos,
-        rmse_pos     = rmse_pos,
-        mae_pos      = mae_pos,
-        var_pos      = var_pos,
-        precision_1m = precision_1m,
         rmse_px=rmse_px, rmse_py=rmse_py, rmse_pz=rmse_pz,
         mae_px=mae_px,   mae_py=mae_py,   mae_pz=mae_pz,
-        # velocity
-        mse_vel      = mse_vel,
-        rmse_vel     = rmse_vel,
-        mae_vel      = mae_vel,
-        var_vel      = var_vel,
         rmse_vx=rmse_vx, rmse_vy=rmse_vy, rmse_vz=rmse_vz,
         mae_vx=mae_vx,   mae_vy=mae_vy,   mae_vz=mae_vz,
-        # full state
-        mse_full     = mse_full,
-        pct_error    = pct_error,
+        mse_pos=mse_pos,   rmse_pos=rmse_pos, mae_pos=mae_pos,
+        var_pos=var_pos,   precision_1m=precision_1m, pct_error=pct_error,
+        mse_vel=mse_vel,   rmse_vel=rmse_vel,
+        mae_vel=mae_vel,   var_vel=var_vel,
+        mse_full=mse_full,
     )
 
-# ══════════════════════════════════════════════
-# KalmanNet inference
-# ══════════════════════════════════════════════:
 
-def run_kalmannet(model: KalmanNet, test_loader: DataLoader, force_cpu: bool = False):
-    target_device = torch.device("cpu") if force_cpu else DEVICE
-    model = model.to(target_device)
+# ══════════════════════════════════════════════
+# Accuracy inference — batched, for predictions only
+# ══════════════════════════════════════════════
+
+def _infer_torch_batched(model: nn.Module, x_np: np.ndarray,
+                          y_np: np.ndarray) -> np.ndarray:
+    """
+    Returns (N, T-1, 6). Handles both KalmanNet (tensor) and
+    KalmanNetStudent (tuple) return types.
+    """
     model.eval()
-
-    all_preds, all_trues = [], []
-    total_time  = 0.0
-    total_steps = 0
-
+    loader = DataLoader(
+        TensorDataset(torch.tensor(x_np), torch.tensor(y_np)),
+        batch_size=32, shuffle=False,
+    )
+    preds = []
     with torch.no_grad():
-        for x_batch, y_batch in test_loader:
-            x_batch = x_batch.to(target_device)
-            y_batch = y_batch.to(target_device)
+        for x_batch, y_batch in loader:
+            x_batch = x_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
+            B       = x_batch.shape[0]
+            out     = model(y_batch, x_batch[:, 0, :])
+            # Unwrap tuple if student returns (x_post, gains)
+            pred    = out[0] if isinstance(out, tuple) else out
+            preds.append(pred[:B, 1:, :].cpu().numpy())
+    return np.concatenate(preds, axis=0)   # (N, T-1, 6)
 
-            # Sync GPU before timing if using CUDA
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
 
-            t0   = time.perf_counter()
-            pred = model(y_batch, x_batch[:, 0, :])
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-            t1   = time.perf_counter()
-
-            total_time  += (t1 - t0)
-            total_steps += x_batch.shape[0] * x_batch.shape[1]
-
-            all_preds.append(pred[:, 1:, :].cpu().numpy())
-            all_trues.append(x_batch[:, 1:, :].cpu().numpy())
-
-    preds = np.concatenate(all_preds, axis=0)
-    trues = np.concatenate(all_trues, axis=0)
-    lat   = (total_time / total_steps) * 1000.0
-
-    return preds, trues, lat, ("CPU" if force_cpu else str(target_device).upper())
-
-def run_kalmannet_stepwise(model: KalmanNet, x_np: np.ndarray, y_np: np.ndarray):
-    """
-    Step-wise KalmanNet inference on CPU for fair latency measurement.
-    Processes one sequence, one timestep at a time — no batching.
-    Returns latency only (predictions already computed in run_kalmannet).
-    """
-    model = model.to("cpu")
-    model.eval()
-
-    N, T, _ = x_np.shape
-    step_times = []
-
-    with torch.no_grad():
-        for i in range(N):
-            x_seq = torch.tensor(x_np[i], dtype=torch.float32)   # (T, 6)
-            y_seq = torch.tensor(y_np[i], dtype=torch.float32)   # (T, 3)
-
-            # Initialise hidden states — shape matches GRUCell (1, N_rnn)
-            h_Q     = torch.zeros(1, model.N_rnn)
-            h_Sigma = torch.zeros(1, model.N_rnn)
-            h_S     = torch.zeros(1, model.N_rnn)
-
-            x_post = torch.zeros(T, model.m)
-            x_post[0] = x_seq[0]   # x0 from ground truth
-
-            for t in range(1, T):
-                t0 = time.perf_counter()
-
-                y      = y_seq[t].unsqueeze(0)       # (1, 3)
-                y_prev = y_seq[t - 1].unsqueeze(0)   # (1, 3)
-                delta_y = y - y_prev
-
-                e_post = (x_post[t - 1] - x_post[t - 2]).unsqueeze(0) \
-                         if t > 1 else torch.zeros(1, model.m)
-
-                h_Q     = model.GRU_Q(delta_y, h_Q)
-                h_Sigma = model.GRU_Sigma(e_post, h_Sigma)
-                h_S     = model.GRU_S(delta_y, h_S)
-
-                feat = torch.cat([h_Q, h_Sigma, h_S,
-                                  y, x_post[t - 1].unsqueeze(0)], dim=1)
-                feat = model.norm(feat)
-                feat = torch.relu(model.fc1(feat))
-                feat = torch.relu(model.fc2(feat))
-                K    = model.fc3(feat).view(1, model.m, model.n)
-
-                x_prior = (model.F @ x_post[t - 1].unsqueeze(1)).squeeze(1)
-                y_pred  = model.H(x_prior.unsqueeze(0)).squeeze(0)
-                innov   = y.squeeze(0) - y_pred
-
-                correction  = (K @ innov.unsqueeze(1)).squeeze()
-                x_post[t]   = x_prior + correction
-
-                t1 = time.perf_counter()
-                step_times.append((t1 - t0) * 1000.0)   # ms
-
-    mean_lat = float(np.mean(step_times))
-    std_lat  = float(np.std(step_times))
-    return mean_lat, std_lat
-
-# ══════════════════════════════════════════════
-# EKF inference
-# ══════════════════════════════════════════════
-
-def run_ekf(x_gt: np.ndarray, y_meas: np.ndarray,H_matrix=None,sigma_y=None,vel_std=None):
-    """
-    Args:
-        x_gt   : (N, T, 6)
-        y_meas : (N, T, 3)
-
-    Returns:
-        preds  : (N, T-1, 6)  — predictions for t=1…T-1
-        lat    : ms per timestep
-    """
+def _infer_ekf(x_gt: np.ndarray, y_meas: np.ndarray,
+               H_matrix: np.ndarray, sigma_r: np.ndarray) -> np.ndarray:
+    """Returns (N, T-1, 6)."""
     N, T, _ = x_gt.shape
-    sigma_y = np.std(y_meas, axis=(0, 1))
-    ekf      = ExtendedKalmanFilter(dt=0.01,sigma_y=sigma_y,H_matrix=H_matrix,vel_std=vel_std)
     preds    = np.zeros((N, T - 1, 6), dtype=np.float64)
 
+    for i in range(N):
+        ekf       = ExtendedKalmanFilter(dt=0.01)
+        ekf.H     = H_matrix                          # fitted H
+        ekf.R     = np.diag(sigma_r ** 2)             # residual-based R
+        ekf.reset(x_gt[i, 0, :])
+        for t in range(1, T):
+            preds[i, t - 1, :] = ekf.step(y_meas[i, t, :])
+    return preds
+
+
+# ══════════════════════════════════════════════
+# Step-wise latency — one sequence, one step at a time
+# ══════════════════════════════════════════════
+
+def _lat_torch(model: nn.Module, x_np: np.ndarray,
+               y_np: np.ndarray, device: torch.device,
+               n_seq: int) -> tuple:
+    """
+    Manually unrolls the model one step at a time on `device`.
+    Works for both KalmanNet and KalmanNetStudent.
+    Returns (mean_ms, std_ms).
+    """
+    model = model.to(device)
+    model.eval()
+
+    is_student = isinstance(model, KalmanNetStudent)
+    N          = x_np.shape[0]
+    T          = x_np.shape[1]
+    n_seq      = min(n_seq, N)
     step_times = []
 
-    for i in range(N):
+    with torch.no_grad():
+        for i in range(n_seq):
+            x_seq = torch.tensor(x_np[i], dtype=torch.float32, device=device)
+            y_seq = torch.tensor(y_np[i], dtype=torch.float32, device=device)
+
+            if is_student:
+                h_fused = torch.zeros(1, model.N_rnn, device=device)
+            else:
+                h_Q     = torch.zeros(1, model.N_rnn, device=device)
+                h_Sigma = torch.zeros(1, model.N_rnn, device=device)
+                h_S     = torch.zeros(1, model.N_rnn, device=device)
+
+            x_post    = torch.zeros(T, model.m, device=device)
+            x_post[0] = x_seq[0]
+
+            for t in range(1, T):
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
+                y       = y_seq[t].unsqueeze(0)      # (1, n)
+                y_prev  = y_seq[t - 1].unsqueeze(0)
+                delta_y = y - y_prev
+                e_post  = ((x_post[t - 1] - x_post[t - 2]).unsqueeze(0)
+                           if t > 1
+                           else torch.zeros(1, model.m, device=device))
+
+                if is_student:
+                    gru_in  = torch.cat([delta_y, e_post, y_prev], dim=1)
+                    h_fused = model.GRU_fused(gru_in, h_fused)
+                    feat    = torch.cat([h_fused, y,
+                                         x_post[t - 1].unsqueeze(0)], dim=1)
+                    feat    = F.elu(model.fc1(feat))
+                    feat    = model.norm(feat)
+                    feat    = F.elu(model.fc2(feat))
+                    K       = model.fc3(feat).view(1, model.m, model.n)
+                    K       = torch.clamp(K, -1.0, 1.0)
+                else:
+                    h_Q     = model.GRU_Q(delta_y, h_Q)
+                    h_Sigma = model.GRU_Sigma(e_post, h_Sigma)
+                    h_S     = model.GRU_S(delta_y, h_S)
+                    feat    = torch.cat([h_Q, h_Sigma, h_S,
+                                         y, x_post[t - 1].unsqueeze(0)], dim=1)
+                    feat    = model.norm(feat)
+                    feat    = torch.relu(model.fc1(feat))
+                    feat    = torch.relu(model.fc2(feat))
+                    K       = model.fc3(feat).view(1, model.m, model.n)
+
+                x_prior   = (model.F @ x_post[t - 1].unsqueeze(1)).squeeze(1)
+                y_pred    = model.H(x_prior.unsqueeze(0)).squeeze(0)
+                innov     = y.squeeze(0) - y_pred
+                x_post[t] = x_prior + (K @ innov.unsqueeze(1)).squeeze()
+
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                step_times.append((t1 - t0) * 1000.0)
+
+    return float(np.mean(step_times)), float(np.std(step_times))
+
+
+def _lat_ekf(x_gt: np.ndarray, y_meas: np.ndarray, n_seq: int,
+             H_matrix: np.ndarray, sigma_r: np.ndarray) -> tuple:
+    """Returns (mean_ms, std_ms) for EKF on CPU."""
+    N, T, _    = x_gt.shape
+    n_seq      = min(n_seq, N)
+    step_times = []
+
+    for i in range(n_seq):
+        ekf   = ExtendedKalmanFilter(dt=0.01)
+        ekf.H = H_matrix
+        ekf.R = np.diag(sigma_r ** 2)
         ekf.reset(x_gt[i, 0, :])
         for t in range(1, T):
             t0 = time.perf_counter()
-            preds[i, t - 1, :] = ekf.step(y_meas[i, t, :])
+            ekf.step(y_meas[i, t, :])
             t1 = time.perf_counter()
             step_times.append((t1 - t0) * 1000.0)
-
-    lat_mean = float(np.mean(step_times))
-    lat_std  = float(np.std(step_times))
-    return preds, lat_mean, lat_std, "CPU"
-
+    return float(np.mean(step_times)), float(np.std(step_times))
 
 # ══════════════════════════════════════════════
-# Pretty-print helpers
+# Print helpers
 # ══════════════════════════════════════════════
 
-def print_results(name: str, m: dict, latency_ms: float, lat_device: str,latency_std: float):
-    print(f"\n=== {name} RESULTS ===")
-    print(f"  -- Position (px, py, pz) --")
+def _print_model_results(name: str, m: dict,
+                          cpu_mean: float, cpu_std: float,
+                          gpu_mean: float, gpu_std: float):
+    gpu_str = (f"{gpu_mean:.4f} ± {gpu_std:.4f} ms"
+               if gpu_mean >= 0 else "N/A (CPU-only model)")
+
+    print(f"\n{'=' * 62}")
+    print(f"  {name}")
+    print(f"{'=' * 62}")
+
+    print(f"\n  ── Position (px, py, pz) {'─' * 30}")
     print(f"  MSE                      : {m['mse_pos']:.6f} m²")
     print(f"  RMSE                     : {m['rmse_pos']:.4f} m")
-    print(f"  RMSE_x / y / z           : {m['rmse_px']:.4f} / {m['rmse_py']:.4f} / {m['rmse_pz']:.4f} m")
+    print(f"  RMSE  x / y / z          : {m['rmse_px']:.4f} / {m['rmse_py']:.4f} / {m['rmse_pz']:.4f} m")
     print(f"  MAE                      : {m['mae_pos']:.4f} m")
-    print(f"  MAE_x  / y / z           : {m['mae_px']:.4f} / {m['mae_py']:.4f} / {m['mae_pz']:.4f} m")
-    print(f"  Error Variance           : {m['var_pos']:.4f}")
-    print(f"  Inlier Precision (<1m)   : {m['precision_1m']:.2f} %")
+    print(f"  MAE   x / y / z          : {m['mae_px']:.4f} / {m['mae_py']:.4f} / {m['mae_pz']:.4f} m")
+    print(f"  Error Variance           : {m['var_pos']:.6f}")
+    print(f"  Inlier Precision (<1 m)  : {m['precision_1m']:.2f} %")
     print(f"  % Pos Error (rel. mean)  : {m['pct_error']:.4f} %")
-    print(f"  -- Velocity (vx, vy, vz) --")
+
+    print(f"\n  ── Velocity (vx, vy, vz) {'─' * 30}")
     print(f"  MSE                      : {m['mse_vel']:.6f} (m/s)²")
     print(f"  RMSE                     : {m['rmse_vel']:.4f} m/s")
-    print(f"  RMSE_vx / vy / vz        : {m['rmse_vx']:.4f} / {m['rmse_vy']:.4f} / {m['rmse_vz']:.4f} m/s")
+    print(f"  RMSE  vx / vy / vz       : {m['rmse_vx']:.4f} / {m['rmse_vy']:.4f} / {m['rmse_vz']:.4f} m/s")
     print(f"  MAE                      : {m['mae_vel']:.4f} m/s")
-    print(f"  MAE_vx  / vy / vz        : {m['mae_vx']:.4f} / {m['mae_vy']:.4f} / {m['mae_vz']:.4f} m/s")
-    print(f"  Error Variance           : {m['var_vel']:.4f}")
-    print(f"  -- Full State --")
+    print(f"  MAE   vx / vy / vz       : {m['mae_vx']:.4f} / {m['mae_vy']:.4f} / {m['mae_vz']:.4f} m/s")
+    print(f"  Error Variance           : {m['var_vel']:.6f}")
+
+    print(f"\n  ── Full State {'─' * 42}")
     print(f"  MSE                      : {m['mse_full']:.6f}")
-    print(f"  -- Latency (step-wise, CPU) --")
-    print(f"  Mean                     : {latency_ms:.4f} ms / step")
-    print(f"  Std                      : {latency_std:.4f} ms")
+
+    print(f"\n  ── Latency (step-wise, 1 seq × 1 step) {'─' * 16}")
+    print(f"  CPU   mean ± std         : {cpu_mean:.4f} ± {cpu_std:.4f} ms/step")
+    print(f"  GPU   mean ± std         : {gpu_str}")
 
 
+def _print_comparison(names: list, metrics: list,
+                       cpu_means: list, cpu_stds: list,
+                       gpu_means: list, gpu_stds: list):
+    W   = 14
+    NC  = len(names)
+    div = "=" * (30 + (W + 1) * NC)
 
-def print_comparison(ekf_m, ekf_lat, ekf_std, ekf_dev, knet_m, knet_step_lat, knet_step_std, knet_dev):
-    W = 14
-    div = "=" * 60
     print(f"\n{div}")
-    print("=== COMPARISON")
+    print("  THREE-WAY COMPARISON TABLE")
     print(div)
-    print(f"  {'Metric':<28} {'EKF':>{W}} {'KalmanNet':>{W}}")
-    print(f"  {'-'*28} {'-'*W} {'-'*W}")
 
-    rows = [
-        ("--- Position ---",       None,                    None),
-        ("MSE (m²)",               ekf_m['mse_pos'],        knet_m['mse_pos']),
-        ("RMSE (m)",               ekf_m['rmse_pos'],       knet_m['rmse_pos']),
-        ("RMSE_x (m)",             ekf_m['rmse_px'],        knet_m['rmse_px']),
-        ("RMSE_y (m)",             ekf_m['rmse_py'],        knet_m['rmse_py']),
-        ("RMSE_z (m)",             ekf_m['rmse_pz'],        knet_m['rmse_pz']),
-        ("MAE (m)",                ekf_m['mae_pos'],        knet_m['mae_pos']),
-        ("MAE_x (m)",              ekf_m['mae_px'],         knet_m['mae_px']),
-        ("MAE_y (m)",              ekf_m['mae_py'],         knet_m['mae_py']),
-        ("MAE_z (m)",              ekf_m['mae_pz'],         knet_m['mae_pz']),
-        ("Error Variance",         ekf_m['var_pos'],        knet_m['var_pos']),
-        ("Precision (<1m) %",      ekf_m['precision_1m'],   knet_m['precision_1m']),
-        ("% Pos Error",            ekf_m['pct_error'],      knet_m['pct_error']),
-        ("--- Velocity ---",       None,                    None),
-        ("MSE (m/s)²",             ekf_m['mse_vel'],        knet_m['mse_vel']),
-        ("RMSE (m/s)",             ekf_m['rmse_vel'],       knet_m['rmse_vel']),
-        ("RMSE_vx (m/s)",          ekf_m['rmse_vx'],        knet_m['rmse_vx']),
-        ("RMSE_vy (m/s)",          ekf_m['rmse_vy'],        knet_m['rmse_vy']),
-        ("RMSE_vz (m/s)",          ekf_m['rmse_vz'],        knet_m['rmse_vz']),
-        ("MAE (m/s)",              ekf_m['mae_vel'],        knet_m['mae_vel']),
-        ("MAE_vx (m/s)",           ekf_m['mae_vx'],         knet_m['mae_vx']),
-        ("MAE_vy (m/s)",           ekf_m['mae_vy'],         knet_m['mae_vy']),
-        ("MAE_vz (m/s)",           ekf_m['mae_vz'],         knet_m['mae_vz']),
-        ("Error Variance",         ekf_m['var_vel'],        knet_m['var_vel']),
-        ("--- Full State ---",     None,                    None),
-        ("MSE",                    ekf_m['mse_full'],       knet_m['mse_full']),
-        ("--- Latency ---",        None,                    None),
-        ("ms/step (CPU, mean)",    ekf_lat,   knet_step_lat),
-        ("ms/step (CPU, ±std)",    ekf_std,   knet_step_std),
-    ]
+    hdr = f"  {'Metric':<28}"
+    for n in names:
+        hdr += f" {n:>{W}}"
+    print(hdr)
+    print(f"  {'-'*28}" + f" {'-'*W}" * NC)
 
-    for label, ev, kv in rows:
-        if ev is None and kv is None and label.startswith("---"):
-            print(f"\n  {label}")
-            continue
-        e_str = f"{ev:>{W}.4f}" if ev is not None else f"{'—':>{W}}"
-        k_str = f"{kv:>{W}.4f}" if kv is not None else f"{'—':>{W}}"
-        print(f"  {label:<28} {e_str} {k_str}")
+    def row(label, vals):
+        line = f"  {label:<28}"
+        for v in vals:
+            line += f" {v:>{W}.4f}" if isinstance(v, float) and v >= 0 else f" {'N/A':>{W}}"
+        print(line)
+
+    def sec(title):
+        print(f"\n  ── {title}")
+
+    sec("Position ──────────────────────────────────")
+    row("MSE (m²)",             [m['mse_pos']      for m in metrics])
+    row("RMSE (m)",             [m['rmse_pos']     for m in metrics])
+    row("RMSE_x (m)",           [m['rmse_px']      for m in metrics])
+    row("RMSE_y (m)",           [m['rmse_py']      for m in metrics])
+    row("RMSE_z (m)",           [m['rmse_pz']      for m in metrics])
+    row("MAE (m)",              [m['mae_pos']      for m in metrics])
+    row("MAE_x (m)",            [m['mae_px']       for m in metrics])
+    row("MAE_y (m)",            [m['mae_py']       for m in metrics])
+    row("MAE_z (m)",            [m['mae_pz']       for m in metrics])
+    row("Var (pos)",            [m['var_pos']      for m in metrics])
+    row("Precision <1m (%)",    [m['precision_1m'] for m in metrics])
+    row("% Pos Error",          [m['pct_error']    for m in metrics])
+
+    sec("Velocity ──────────────────────────────────")
+    row("MSE (m/s)²",           [m['mse_vel']      for m in metrics])
+    row("RMSE (m/s)",           [m['rmse_vel']     for m in metrics])
+    row("RMSE_vx (m/s)",        [m['rmse_vx']      for m in metrics])
+    row("RMSE_vy (m/s)",        [m['rmse_vy']      for m in metrics])
+    row("RMSE_vz (m/s)",        [m['rmse_vz']      for m in metrics])
+    row("MAE (m/s)",            [m['mae_vel']      for m in metrics])
+    row("MAE_vx (m/s)",         [m['mae_vx']       for m in metrics])
+    row("MAE_vy (m/s)",         [m['mae_vy']       for m in metrics])
+    row("MAE_vz (m/s)",         [m['mae_vz']       for m in metrics])
+    row("Var (vel)",            [m['var_vel']      for m in metrics])
+
+    sec("Full State ─────────────────────────────────")
+    row("MSE",                  [m['mse_full']     for m in metrics])
+
+    sec("CPU Latency  step-wise (ms/step) ─────────")
+    row("Mean",                 cpu_means)
+    row("Std",                  cpu_stds)
+
+    sec("GPU Latency  step-wise (ms/step) ─────────")
+    row("Mean",                 gpu_means)
+    row("Std",                  gpu_stds)
 
     print(f"\n{div}\n")
 
@@ -403,74 +452,117 @@ def print_comparison(ekf_m, ekf_lat, ekf_std, ekf_dev, knet_m, knet_step_lat, kn
 # ══════════════════════════════════════════════
 
 def main():
-    # ── Load & sanitize ────────────────────────
-    print(f"Loading test data from: {TEST_DATA}")
+    # ── Load data ─────────────────────────────
+    print(f"Loading: {TEST_DATA}")
     raw     = np.load(TEST_DATA)
-    x_np    = sanitize(raw["x"].astype(np.float32))   # (N, T, 6)
-    y_np    = sanitize(raw["y"].astype(np.float32))   # (N, T, 3)
+    x_np    = _sanitize(raw["x"].astype(np.float32))   # (N, T, 6)
+    y_np    = _sanitize(raw["y"].astype(np.float32))   # (N, T, 3)
     N, T, _ = x_np.shape
-    print(f"  Test set: {N} sequences × {T} timesteps  |  device: {DEVICE}")
+    print(f"  {N} sequences × {T} timesteps | device: {DEVICE}")
+    print(f"  Latency timing: first {min(LATENCY_N_SEQ, N)} sequences\n")
 
-    # ── DataLoader for batched KalmanNet inference ──
-    test_loader = DataLoader(
-        TensorDataset(torch.tensor(x_np), torch.tensor(y_np)),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
+    x_f64   = x_np.astype(np.float64)
+    y_f64   = y_np.astype(np.float64)
+    gt_eval = x_np[:, 1:, :].astype(np.float64)   # (N, T-1, 6)
+
+    x_flat  = x_f64[:, 1:, :].reshape(-1, 6)   # (N*T, 6)
+    y_flat  = y_f64[:, 1:, :].reshape(-1, 3)   # (N*T, 3)
+    H_fit, _, _, _ = np.linalg.lstsq(x_flat, y_flat, rcond=None)
+    H_fit   = H_fit.T.astype(np.float64)        # (3, 6)
+    print(f"  Fitted H matrix:\n{np.round(H_fit, 4)}")
+    y_pred_flat = (H_fit @ x_flat.T).T          # (N*T, 3)
+    residuals   = y_flat - y_pred_flat
+    sigma_r     = np.std(residuals, axis=0)     # (3,)
+    print(f"  Residual sigma_r: {np.round(sigma_r, 4)}")
+    # ── Load models ───────────────────────────
+    print(f"Loading KalmanNet from:  {KNET_WEIGHTS}")
+    knet = KalmanNet(m=6, n=3, N_rnn=32).to(DEVICE)
+    knet.load_state_dict(torch.load(KNET_WEIGHTS, map_location=DEVICE))
+    knet.eval()
+    print(f"  Params: {sum(p.numel() for p in knet.parameters()):,}")
+
+    print(f"Loading Student from:    {STUDENT_WEIGHTS}")
+    student = KalmanNetStudent(N_rnn=24).to(DEVICE)
+    student.load_state_dict(torch.load(STUDENT_WEIGHTS, map_location=DEVICE))
+    student.eval()
+    print(f"  Params: {sum(p.numel() for p in student.parameters()):,}")
+
+    # ── Batched accuracy inference ─────────────
+    print("\nRunning accuracy inference (batched)…")
+    knet_preds    = _infer_torch_batched(knet,    x_np, y_np)
+    student_preds = _infer_torch_batched(student, x_np, y_np)
+    y_flat = y_f64.reshape(-1, 3)
+    print(f"  y range before clip: {y_flat.min(axis=0)} → {y_flat.max(axis=0)}")
+    y_lo = np.percentile(y_flat, 1, axis=0)
+    y_hi = np.percentile(y_flat, 99, axis=0)
+    print(f"  y 1-99 pct bounds:   {y_lo} → {y_hi}")
+    ekf_preds     = _infer_ekf(x_f64, y_f64, H_fit, sigma_r)
+    print("  Done.")
+
+    # ── Metrics ───────────────────────────────
+    print("Computing metrics…")
+    knet_m  = compute_metrics(knet_preds.astype(np.float64),    gt_eval)
+    stu_m   = compute_metrics(student_preds.astype(np.float64), gt_eval)
+    ekf_m   = compute_metrics(ekf_preds,                        gt_eval)
+
+    # ── Step-wise CPU latency ──────────────────
+    cpu = torch.device("cpu")
+    print(f"\nStep-wise CPU latency ({LATENCY_N_SEQ} seqs)…")
+
+    print("  EKF…")
+    ekf_cpu_m, ekf_cpu_s = _lat_ekf(x_f64, y_f64, LATENCY_N_SEQ, H_fit, sigma_r)
+
+    print("  KalmanNet…")
+    knet_cpu_m, knet_cpu_s = _lat_torch(knet, x_np, y_np, cpu, LATENCY_N_SEQ)
+
+    print("  Student…")
+    stu_cpu_m, stu_cpu_s = _lat_torch(student, x_np, y_np, cpu, LATENCY_N_SEQ)
+
+    # Restore to DEVICE after CPU latency pass
+    knet.to(DEVICE)
+    student.to(DEVICE)
+
+    # ── Step-wise GPU latency ──────────────────
+    ekf_gpu_m = ekf_gpu_s = -1.0   # EKF always CPU-only
+
+    if HAS_CUDA:
+        print(f"\nStep-wise GPU latency ({LATENCY_N_SEQ} seqs)…")
+
+        print("  KalmanNet…")
+        knet_gpu_m, knet_gpu_s = _lat_torch(knet, x_np, y_np, DEVICE, LATENCY_N_SEQ)
+
+        print("  Student…")
+        stu_gpu_m, stu_gpu_s = _lat_torch(student, x_np, y_np, DEVICE, LATENCY_N_SEQ)
+
+        knet.to(DEVICE)
+        student.to(DEVICE)
+    else:
+        print("\n  No CUDA — GPU latency skipped.")
+        knet_gpu_m = knet_gpu_s = -1.0
+        stu_gpu_m  = stu_gpu_s  = -1.0
+
+    # ── Individual result blocks ───────────────
+    _print_model_results(
+        "KALMANNET — Teacher",
+        knet_m, knet_cpu_m, knet_cpu_s, knet_gpu_m, knet_gpu_s)
+
+    _print_model_results(
+        "KALMANNET STUDENT — Shadow",
+        stu_m, stu_cpu_m, stu_cpu_s, stu_gpu_m, stu_gpu_s)
+
+    _print_model_results(
+        "EKF — Baseline",
+        ekf_m, ekf_cpu_m, ekf_cpu_s, ekf_gpu_m, ekf_gpu_s)
+
+    # ── Three-way comparison table ─────────────
+    _print_comparison(
+        names    = ["EKF", "KalmanNet", "Student"],
+        metrics  = [ekf_m, knet_m, stu_m],
+        cpu_means= [ekf_cpu_m, knet_cpu_m, stu_cpu_m],
+        cpu_stds = [ekf_cpu_s, knet_cpu_s, stu_cpu_s],
+        gpu_means= [ekf_gpu_m, knet_gpu_m, stu_gpu_m],
+        gpu_stds = [ekf_gpu_s, knet_gpu_s, stu_gpu_s],
     )
-
-    # ── Load KalmanNet ─────────────────────────
-    print(f"\nLoading KalmanNet weights from: {KNET_WEIGHTS}")
-    model = KalmanNet(m=6, n=3, N_rnn=32).to(DEVICE)
-    state = torch.load(KNET_WEIGHTS, map_location=DEVICE, weights_only=True)
-    model.load_state_dict(state)
-    print("  Weights loaded successfully.")
-
-    # ── KalmanNet inference ────────────────────
-
-    # ── KalmanNet on native device ─────────────
-    print(f"Running KalmanNet on {DEVICE} for accuracy…")
-    knet_preds, gt_eval, knet_lat, knet_dev = run_kalmannet(model, test_loader,
-                                                              force_cpu=False)
-    print("Running KalmanNet step-wise on CPU for fair latency benchmark…")
-    knet_step_lat, knet_step_std = run_kalmannet_stepwise(model, x_np, y_np)
-    
-    # ── EKF inference ──────────────────────────
-    x_flat = x_np[:, 1:, :].reshape(-1, 6)   # (N*T, 6)
-    y_flat = y_np[:, 1:, :].reshape(-1, 3)   # (N*T, 3)
-
-    for j in range(3):
-        corrs = [np.corrcoef(y_flat[:, j], x_flat[:, i])[0,1] for i in range(6)]
-        best  = int(np.argmax(np.abs(corrs)))
-    
-    H_fit, _, _, _ = np.linalg.lstsq(x_flat, y_flat, rcond=None)  # (6,3)
-    H_fit = H_fit.T  # (3,6)
-
-    y_pred_flat = (H_fit @ x_flat.T).T         
-    residuals   = y_flat - y_pred_flat           
-    sigma_r     = np.std(residuals, axis=0)      
-    
-    vel_std = np.std(np.diff(x_np[:, :, 3:6], axis=1), axis=(0, 1))
-
-    print("Running EKF inference…")
-    ekf_preds, ekf_lat, ekf_std, ekf_dev = run_ekf(
-        x_np.astype(np.float64),
-        y_np.astype(np.float64),
-        H_matrix=H_fit,
-        sigma_y=sigma_r,
-        vel_std=vel_std
-    )
-    gt_ekf = x_np[:, 1:, :].astype(np.float64)  
-
-    # ── Metrics ────────────────────────────────
-    knet_metrics = compute_metrics(knet_preds.astype(np.float64),
-                                   gt_eval.astype(np.float64))
-    ekf_metrics = compute_metrics(ekf_preds, gt_ekf)
-
-    # ── Output ─────────────────────────────────
-    print_results("KALMANNET", knet_metrics, knet_step_lat, "CPU", knet_step_std,)
-    print_results("EKF",       ekf_metrics,  ekf_lat, "CPU",      ekf_std,       )
-    print_comparison(ekf_metrics,  ekf_lat,       ekf_std,       "CPU",
-                     knet_metrics, knet_step_lat, knet_step_std, "CPU")
 
 
 if __name__ == "__main__":

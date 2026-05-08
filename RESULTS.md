@@ -3,7 +3,7 @@
 Branch: `kalyani`
 Last updated: 2026-05-05
 
-> **Phase 2 (RL Meta-Tuner) results are documented separately in [`RL_RESULTS.md`](RL_RESULTS.md).**
+> RL meta-tuner extension is on the **`kalyani-RL`** branch.
 
 ---
 

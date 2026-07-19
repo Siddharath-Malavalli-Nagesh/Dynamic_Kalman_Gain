@@ -6,7 +6,7 @@ class ExtendedKalmanFilter:
     Extended Kalman Filter for constant-velocity state estimation.
 
     State:   x = [px, py, pz, vx, vy, vz]  (dim = 6)
-    Measure: z = [vx, vy, vz]               (dim = 3)
+    Measure: z = [px, py, pz]               (dim = 3)
     """
 
     def __init__(self, dt: float = 0.01,
@@ -26,14 +26,14 @@ class ExtendedKalmanFilter:
         self.F[1, 4] = dt
         self.F[2, 5] = dt
 
-        # --- Measurement matrix H (3x6): observe velocities ---
+        # --- Measurement matrix H (3x6): observe position ---
         if H_matrix is not None:
             self.H = H_matrix.astype(np.float64)
         else:
             self.H = np.array([
-                [0, 0, 0, 1, 0, 0],  # vx
-                [0, 1, 0, 0, 0, 0],  # vy
-                [0, 0, 1, 0, 0, 0],  # vz
+                [0, 0, 0, 1, 0, 0],  # px
+                [0, 1, 0, 0, 0, 0],  # py
+                [0, 0, 1, 0, 0, 0],  # pz
             ], dtype=np.float64)
 
         # --- Process noise covariance Q (6x6) ---
@@ -46,10 +46,10 @@ class ExtendedKalmanFilter:
         self.Q = np.diag(np.concatenate([q_pos, q_vel])).astype(np.float64)
 
         # --- Measurement noise covariance R (3x3) ---
-        sigma_y = np.array([0.1, 0.1, 0.1])   # tune this
         if sigma_y is None:
             sigma_y = np.array([0.1, 0.1, 0.1])
-        self.R = np.diag(sigma_y**2).astype(np.float64)
+        sigma_y = np.asarray(sigma_y, dtype=np.float64)
+        self.R = np.diag(sigma_y ** 2).astype(np.float64)
 
         # --- State & covariance (initialised in reset) ---
         self.x = np.zeros(6, dtype=np.float64)

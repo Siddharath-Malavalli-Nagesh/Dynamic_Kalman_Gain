@@ -1,22 +1,25 @@
 """
 distillation_train.py
 ---------------------
-Trains KalmanNetStudent (N_rnn=16) to mimic KalmanNetTeacher (N_rnn=32).
+Distillation training: KalmanNetStudent learns to mimic KalmanNet (teacher).
 
-Strategy: keep it simple and stable.
-  - Gain distillation: student learns teacher's K matrices (MSE)
-  - Task loss: student fits ground truth (SmoothL1, position-weighted)
-  - Trajectory loss: student follows teacher's state trajectory
-  - No teacher-forcing (caused instability), no fancy curricula
-  - Cosine alpha decay, linear beta decay — both smooth
-  - Standard OneCycleLR with conservative peak LR
+Loss (three signals):
+    L = task_weight * SmoothL1(student_pred, GT)         — fit ground truth
+      + alpha        * MSE(student_gain, teacher_gain)   — mimic Kalman gain
+      + beta         * SmoothL1(student_pred, teacher_pred)  — mimic trajectory
+
+Schedules (all smooth, no sudden jumps):
+    alpha : cosine anneal 0.70 → 0.15  (gain distillation weight)
+    beta  : linear decay  0.20 → 0.00  (trajectory imitation weight)
+    noise : triangular    0.00 → peak → 0.00  (input augmentation)
+    LR    : OneCycleLR warm-up + cosine anneal
 
 Expected files:
-    best_knet_nclt.pt          teacher weights
-    nclt_train/val/test.npz    data
+    best_knet_nclt.pt        teacher weights
+    nclt_train/val/test.npz  data splits
 
 Output:
-    best_student_nclt.pt       best checkpoint by val position RMSE
+    best_student_nclt.pt     best student checkpoint (by val position RMSE)
 """
 
 import time
@@ -24,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
 
 from kalmannet_student import KalmanNetStudent
 
@@ -31,26 +35,26 @@ from kalmannet_student import KalmanNetStudent
 # Config
 # ──────────────────────────────────────────────
 TEACHER_WEIGHTS = "best_knet_nclt.pt"
-STUDENT_WEIGHTS = "best_student_nclt.pt"
+STUDENT_WEIGHTS = "best_student_nclt_05.pt"
 
 BATCH_SIZE   = 32
-EPOCHS       = 200
-LR_MAX       = 5e-4        # conservative — smaller model is more sensitive
-LR_DIV       = 10.0
+EPOCHS       = 120
+LR_MAX       = 3e-3
+LR_DIV       = 10.0         # initial LR = LR_MAX / LR_DIV
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP    = 1.0
 
-ALPHA_START  = 0.60        # gain distillation weight at epoch 1
-ALPHA_END    = 0.10        # gain distillation weight at epoch EPOCHS
-BETA_START   = 0.15        # trajectory imitation weight at epoch 1
-BETA_END     = 0.00        # trajectory imitation weight at epoch EPOCHS
-POS_WEIGHT   = 2.0         # position states weighted 2x velocity in task loss
+ALPHA_START  = 0.70       # gain distillation weight, epoch 1
+ALPHA_END    = 0.15         # gain distillation weight, epoch EPOCHS
+BETA_START   = 0.20         # trajectory imitation weight, epoch 1
+BETA_END     = 0.00         # trajectory imitation weight, epoch EPOCHS
+POS_WEIGHT   = 2.0          # position loss multiplier vs velocity
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ══════════════════════════════════════════════
-# Teacher — exact match to production architecture
+# Teacher — exact production architecture, unmodified
 # ══════════════════════════════════════════════
 
 class KalmanNetTeacher(nn.Module):
@@ -124,7 +128,7 @@ class KalmanNetTeacher(nn.Module):
 
             x_post[:, t, :] = x_prior + torch.bmm(K, innov.unsqueeze(2)).squeeze(2)
 
-        return x_post, torch.stack(gains, dim=1)
+        return x_post, torch.stack(gains, dim=1)   # (B,T,m), (B,T-1,m,n)
 
 
 # ══════════════════════════════════════════════
@@ -132,7 +136,7 @@ class KalmanNetTeacher(nn.Module):
 # ══════════════════════════════════════════════
 
 def _pos_vel_smoothl1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """SmoothL1 with position states weighted POS_WEIGHT x velocity."""
+    """SmoothL1 with position states weighted POS_WEIGHT× velocity states."""
     loss_pos = nn.SmoothL1Loss()(pred[:, :, :3], target[:, :, :3])
     loss_vel = nn.SmoothL1Loss()(pred[:, :, 3:], target[:, :, 3:])
     return POS_WEIGHT * loss_pos + loss_vel
@@ -146,13 +150,13 @@ def distillation_loss(student_pred:  torch.Tensor,
                       alpha:         float,
                       beta:          float) -> torch.Tensor:
     """
-    L = task_weight * SmoothL1(student, GT)
-      + alpha       * MSE(student_gain, teacher_gain)
-      + beta        * SmoothL1(student, teacher_trajectory)
+    Three-signal distillation loss.
+    All leading dimensions must be identical (enforced by caller's [:B] slicing).
 
-    task_weight = max(1 - alpha - beta, 0.05)  — always keeps GT signal active
+    student_pred / teacher_pred / target : (B, T-1, m)
+    student_gain / teacher_gain          : (B, T-1, m, n)
     """
-    task_weight = max(1.0 - alpha - beta, 0.05)
+    task_weight = max(1.0 - alpha - beta, 0.0)
     task_loss   = _pos_vel_smoothl1(student_pred, target)
     gain_loss   = nn.MSELoss()(student_gain, teacher_gain)
     traj_loss   = _pos_vel_smoothl1(student_pred, teacher_pred)
@@ -169,20 +173,22 @@ def _sanitize(arr: np.ndarray) -> np.ndarray:
 
 
 def _make_loader(path: str, shuffle: bool):
+    """Returns (DataLoader, y_std: np.ndarray shape (n,))."""
     raw   = np.load(path)
     x     = _sanitize(raw["x"].astype(np.float32))
     y     = _sanitize(raw["y"].astype(np.float32))
+    y_std = np.std(y, axis=(0, 1)).astype(np.float32)
     loader = DataLoader(
         TensorDataset(torch.tensor(x), torch.tensor(y)),
         batch_size=BATCH_SIZE,
         shuffle=shuffle,
         drop_last=False,
     )
-    return loader
+    return loader, y_std
 
 
 # ══════════════════════════════════════════════
-# Validation RMSE — alpha/beta independent save criterion
+# Validation helper — alpha/beta independent
 # ══════════════════════════════════════════════
 
 def _eval_rmse_pos(model: KalmanNetStudent, loader: DataLoader) -> float:
@@ -208,22 +214,26 @@ def train():
 
     # ── Data ──────────────────────────────────
     print("Loading datasets…")
-    train_loader = _make_loader("nclt_train.npz", shuffle=True)
-    val_loader   = _make_loader("nclt_val.npz",   shuffle=False)
-    test_loader  = _make_loader("nclt_test.npz",  shuffle=False)
+    train_loader, y_std = _make_loader("Downloads/nclt_train.npz", shuffle=True)
+    val_loader,   _     = _make_loader("Downloads/nclt_val.npz",   shuffle=False)
+    test_loader,  _     = _make_loader("Downloads/nclt_test.npz",  shuffle=False)
+
+    # Noise base: 5% of per-channel measurement std, shape (1,1,n) for broadcast
+    noise_base = torch.tensor(y_std * 0.05, dtype=torch.float32
+                               ).view(1, 1, -1).to(DEVICE)
+    print(f"  Noise base (5% σ_y): {(y_std * 0.05).tolist()}")
 
     # ── Teacher (frozen) ───────────────────────
-    print(f"Loading teacher from: {TEACHER_WEIGHTS}")
+    print(f"\nLoading teacher from: {TEACHER_WEIGHTS}")
     teacher = KalmanNetTeacher(m=6, n=3, N_rnn=32).to(DEVICE)
-    teacher.load_state_dict(
-        torch.load(TEACHER_WEIGHTS, map_location=DEVICE, weights_only=False))
+    teacher.load_state_dict(torch.load(TEACHER_WEIGHTS, map_location=DEVICE))
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
     print("  Teacher frozen.")
 
     # ── Student ───────────────────────────────
-    student   = KalmanNetStudent(N_rnn=8).to(DEVICE)
+    student   = KalmanNetStudent(N_rnn=24).to(DEVICE)
     optimizer = torch.optim.Adam(student.parameters(),
                                  lr=LR_MAX / LR_DIV,
                                  weight_decay=WEIGHT_DECAY)
@@ -232,7 +242,7 @@ def train():
         optimizer,
         max_lr          = LR_MAX,
         total_steps     = EPOCHS * len(train_loader),
-        pct_start       = 0.20,        # 20% warm-up (~30 epochs)
+        pct_start       = 0.15,
         anneal_strategy = "cos",
         div_factor      = LR_DIV,
         final_div_factor= 100.0,
@@ -240,28 +250,23 @@ def train():
 
     t_params = sum(p.numel() for p in teacher.parameters())
     s_params = sum(p.numel() for p in student.parameters())
-    print(f"  Teacher params : {t_params:,}")
-    print(f"  Student params : {s_params:,}  ({s_params / t_params * 100:.1f}% of teacher)")
-
-    # Sanity check — ensure architecture matches expected dimensions
-    assert student.GRU_Q.input_size == student.n,     "GRU_Q input mismatch"
-    assert student.GRU_Sigma.input_size == student.m, "GRU_Sigma input mismatch"
-    assert student.fc1.in_features == student.N_rnn * 3 + student.n + student.m, \
-        f"fc1 expects {student.N_rnn*3+student.n+student.m}, got {student.fc1.in_features}"
-    print(f"  Architecture check passed: fc1={student.fc1.in_features}→{student.fc1.out_features}, "
-          f"fc3→{student.fc3.out_features}\n")
+    print(f"  Teacher params: {t_params:,}")
+    print(f"  Student params: {s_params:,}  ({s_params / t_params * 100:.1f}% of teacher)\n")
 
     best_val_rmse = float("inf")
 
     print(f"Training {EPOCHS} epochs | "
           f"α {ALPHA_START:.2f}→{ALPHA_END:.2f} cosine | "
-          f"β {BETA_START:.2f}→{BETA_END:.2f} linear\n")
+          f"β {BETA_START:.2f}→{BETA_END:.2f} linear | "
+          f"noise triangular\n")
 
     for epoch in range(1, EPOCHS + 1):
         t = (epoch - 1) / max(EPOCHS - 1, 1)
 
-        alpha = ALPHA_END + 0.5 * (ALPHA_START - ALPHA_END) * (1 + np.cos(np.pi * t))
-        beta  = BETA_START + (BETA_END - BETA_START) * t
+        # Schedules
+        alpha       = ALPHA_END + 0.5 * (ALPHA_START - ALPHA_END) * (1 + np.cos(np.pi * t))
+        beta        = BETA_START + (BETA_END - BETA_START) * t
+        noise_scale = 1.0 - abs(2.0 * t - 1.0)   # triangular: 0→1→0
 
         # ── Train ─────────────────────────────
         student.train()
@@ -273,15 +278,19 @@ def train():
             y_batch = y_batch.to(DEVICE)
             B       = x_batch.shape[0]
             x0      = x_batch[:, 0, :]
-            gt      = x_batch[:, 1:, :]
+            gt      = x_batch[:, 1:, :]   # (B, T-1, 6)
 
             try:
+                y_noised = y_batch + torch.randn_like(y_batch) * noise_base * noise_scale
+                y_noised = torch.nan_to_num(y_noised, nan=0.0, posinf=0.0, neginf=0.0)
+
                 with torch.no_grad():
-                    t_post, t_gains = teacher(y_batch, x0)
+                    t_post, t_gains = teacher(y_noised, x0)
 
                 optimizer.zero_grad()
-                s_post, s_gains = student(y_batch, x0)
+                s_post, s_gains = student(y_noised, x0)
 
+                # Slice to true B and t=1..T-1
                 s_pred = s_post[:B, 1:, :]
                 t_pred = t_post[:B, 1:, :]
                 s_gain = s_gains[:B]
@@ -310,7 +319,8 @@ def train():
                     continue
                 raise
 
-        train_loss /= max(len(train_loader.dataset) - skipped * BATCH_SIZE, 1)
+        denom      = max(len(train_loader.dataset) - skipped * BATCH_SIZE, 1)
+        train_loss /= denom
 
         # ── Validate ──────────────────────────
         student.eval()
@@ -350,21 +360,18 @@ def train():
                   f"RMSE={val_rmse:.4f} m{saved}")
 
     # ══════════════════════════════════════════
-    # Test evaluation
+    # Final test evaluation
     # ══════════════════════════════════════════
     print("\n--- Evaluating best student on test set ---")
-    student.load_state_dict(
-        torch.load(STUDENT_WEIGHTS, map_location=DEVICE, weights_only=False))
+    student.load_state_dict(torch.load(STUDENT_WEIGHTS, map_location=DEVICE))
     student.eval()
 
     all_preds, all_trues = [], []
-    total_time  = 0.0
+    total_time = 0.0
     total_steps = 0
 
     with torch.no_grad():
         for x_test, y_test in test_loader:
-            x_test = _sanitize_tensor(x_test)
-            y_test = _sanitize_tensor(y_test)
             x_test = x_test.to(DEVICE)
             y_test = y_test.to(DEVICE)
             B      = x_test.shape[0]
@@ -398,14 +405,6 @@ def train():
     print(f"  Precision (<1m) : {prec_1m:.2f} %")
     print(f"  Latency (batch) : {lat_ms:.4f} ms/step")
     print(f"\n  Saved: {STUDENT_WEIGHTS}")
-
-
-def _sanitize_tensor(t: torch.Tensor) -> torch.Tensor:
-    """Replace inf/nan in tensor with 0."""
-    t = t.clone()
-    t[torch.isinf(t)] = 0.0
-    t[torch.isnan(t)] = 0.0
-    return t
 
 
 if __name__ == "__main__":

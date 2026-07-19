@@ -166,6 +166,12 @@ This report compares four state estimation methods:
 - Approximately **30% faster** than KalmanNet while preserving strong estimation performance.
 
 ---
+# Ablation Study
+
+| ALPHA_START | Position RMSE (m) | Velocity RMSE (m/s) | CPU Latency (ms/step) |
+|-------------|-------------------|---------------------|----------------------|
+| 0.50        | 4.7854            | 1.4180              | 0.0726               |
+| 0.85        | 1.7734            | 1.4060              | 0.0679               |
 
 # Conclusion
 

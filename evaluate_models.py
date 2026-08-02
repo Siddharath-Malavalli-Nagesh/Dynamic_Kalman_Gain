@@ -387,7 +387,19 @@ def _lat_ukf(x_gt: np.ndarray, y_meas: np.ndarray, n_seq: int,
             step_times.append((t1 - t0) * 1000.0)
     return float(np.mean(step_times)), float(np.std(step_times))
 
-
+def _infer_ukf_aug(x_gt, y_meas, H_matrix, sigma_r, accel_std=0.1):
+    """UKF with online bias estimation — no H_bias subtraction needed."""
+    N, T, _ = x_gt.shape
+    preds   = np.zeros((N, T - 1, 6), dtype=np.float64)
+    for i in range(N):
+        ukf   = UnscentedKalmanFilter(dt=0.01, accel_std=accel_std,
+                                       augment_bias=True)
+        ukf.R = np.diag(sigma_r ** 2)
+        ukf.reset(x_gt[i, 0, :])
+        for t in range(1, T):
+            full_state = ukf.step(y_meas[i, t, :])
+            preds[i, t - 1, :] = full_state[:6]   # return only state, not bias
+    return preds
 # ══════════════════════════════════════════════
 # PF inference and latency
 # ══════════════════════════════════════════════
@@ -479,7 +491,7 @@ def _print_comparison(names: list, metrics: list,
     div = "=" * (30 + (W + 1) * NC)
 
     print(f"\n{div}")
-    print("  FIVE-WAY COMPARISON TABLE")
+    print("  SEVEN-WAY COMPARISON TABLE")
     print(div)
 
     hdr = f"  {'Metric':<28}"
@@ -609,9 +621,17 @@ def main():
     student_preds = _infer_torch_batched(student, x_np, y_np)
     ekf_preds   = _infer_ekf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std)
     ukf_preds     = _infer_ukf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std)
+    print("  Running UKF (augmented bias)...")
+    ukf_aug_preds = _infer_ukf_aug(x_f64, y_f64, H_fit, sigma_r, accel_std)
     print("  Running PF (200 particles)...")
     pf_preds    = _infer_pf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std,
                                N_particles=200)
+    print("  Running PF (500 particles)...")
+    pf500_preds = _infer_pf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std,
+                             N_particles=500)
+    print("  Running PF (1000 particles)...")
+    pf1000_preds = _infer_pf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std,
+                              N_particles=1000)
     print("  Done.")
 
     # ── Metrics ───────────────────────────────
@@ -621,6 +641,8 @@ def main():
     ekf_m   = compute_metrics(ekf_preds,   gt_eval)
     ukf_m   = compute_metrics(ukf_preds,    gt_eval)
     pf_m    = compute_metrics(pf_preds,     gt_eval)
+    pf500_m = compute_metrics(pf500_preds,gt_eval)
+    pf1000_m = compute_metrics(pf1000_preds,gt_eval)
     # ── Step-wise CPU latency ──────────────────
     cpu = torch.device("cpu")
     print(f"\nStep-wise CPU latency ({LATENCY_N_SEQ} seqs)…")
@@ -638,10 +660,18 @@ def main():
     ukf_cpu_m, ukf_cpu_s = _lat_ukf(x_f64, y_f64, LATENCY_N_SEQ,
                                       H_fit, H_bias_fit, sigma_r, accel_std)
 
-    print("  PF...")
+    print("  PF(200)...")
     pf_cpu_m, pf_cpu_s   = _lat_pf(x_f64, y_f64, LATENCY_N_SEQ,
                                      H_fit, H_bias_fit, sigma_r, accel_std,
                                      N_particles=200)
+    print("  PF(500)...")
+    pf500_cpu_m, pf500_cpu_s   = _lat_pf(x_f64, y_f64, LATENCY_N_SEQ,
+                                         H_fit, H_bias_fit, sigma_r, accel_std,
+                                         N_particles=500)
+    print("  PF(1000)...")
+    pf1000_cpu_m, pf1000_cpu_s   = _lat_pf(x_f64, y_f64, LATENCY_N_SEQ,
+                                             H_fit, H_bias_fit, sigma_r, accel_std,
+                                             N_particles=1000)
 
     # Restore to DEVICE after CPU latency pass
     knet.to(DEVICE)
@@ -685,16 +715,21 @@ def main():
     _print_model_results(
         "PF — Particle Filter (N=200)",
         pf_m, pf_cpu_m, pf_cpu_s, -1.0, -1.0)
-
+    _print_model_results(
+            "PF — Particle Filter (N=500)",
+            pf500_m, pf500_cpu_m, pf500_cpu_s, -1.0, -1.0)
+    _print_model_results(
+                "PF — Particle Filter (N=1000)",
+                pf1000_m, pf1000_cpu_m, pf1000_cpu_s, -1.0, -1.0)
 
     # ── Three-way comparison table ─────────────
     _print_comparison(
-        names    = ["EKF", "UKF", "PF(200)", "KalmanNet", "Student"],
-        metrics  = [ekf_m, ukf_m, pf_m, knet_m, stu_m],
-        cpu_means= [ekf_cpu_m, ukf_cpu_m, pf_cpu_m, knet_cpu_m, stu_cpu_m],
-        cpu_stds = [ekf_cpu_s, ukf_cpu_s, pf_cpu_s, knet_cpu_s, stu_cpu_s],
-        gpu_means= [-1.0,       -1.0,      -1.0,     knet_gpu_m, stu_gpu_m],
-        gpu_stds = [-1.0,       -1.0,      -1.0,     knet_gpu_s, stu_gpu_s],
+        names    = ["EKF", "UKF", "PF(200)","PF(500)","PF(1000)", "KalmanNet", "Student"],
+        metrics  = [ekf_m, ukf_m, pf_m,pf500_m,pf1000_m, knet_m, stu_m],
+        cpu_means= [ekf_cpu_m, ukf_cpu_m, pf_cpu_m,pf500_cpu_m,pf1000_cpu_m, knet_cpu_m, stu_cpu_m],
+        cpu_stds = [ekf_cpu_s, ukf_cpu_s, pf_cpu_s,pf500_cpu_s,pf1000_cpu_s, knet_cpu_s, stu_cpu_s],
+        gpu_means= [-1.0,       -1.0,      -1.0, -1.0,-1.0,    knet_gpu_m, stu_gpu_m],
+        gpu_stds = [-1.0,       -1.0,      -1.0, -1.0,-1.0,    knet_gpu_s, stu_gpu_s],
     )
 
 

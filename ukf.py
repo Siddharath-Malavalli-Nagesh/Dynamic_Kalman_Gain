@@ -27,7 +27,8 @@ class UnscentedKalmanFilter:
                  H_matrix:  np.ndarray = None,
                  alpha:     float      = 1e-3,
                  beta:      float      = 2.0,
-                 kappa:     float      = 0.0):
+                 kappa:     float      = 0.0,
+                 augment_bias: bool = False):
         """
         Args:
             dt        : timestep (s)
@@ -38,6 +39,8 @@ class UnscentedKalmanFilter:
             beta      : prior knowledge of distribution (2 = Gaussian)
             kappa     : secondary scaling (0 recommended for state estimation)
         """
+        self.augment_bias = augment_bias
+        
         self.dt  = dt
         self.n   = 6   # state dim
         self.m   = 3   # measurement dim
@@ -92,6 +95,37 @@ class UnscentedKalmanFilter:
         self.x = np.zeros(6, dtype=np.float64)
         self.P = np.diag([1.0, 1.0, 1.0, 10.0, 10.0, 10.0]).astype(np.float64)
 
+        if augment_bias:
+                    self.n = 9   # augment state with [bx, by, bz]
+                    # Recalculate sigma point weights for n=9
+                    n   = self.n
+                    lam = alpha**2 * (n + kappa) - n
+                    self.lam = lam
+                    self.Wm  = np.full(2*n+1, 1/(2*(n+lam)))
+                    self.Wc  = np.full(2*n+1, 1/(2*(n+lam)))
+                    self.Wm[0] = lam/(n+lam)
+                    self.Wc[0] = lam/(n+lam) + (1 - alpha**2 + beta)
+        
+                    # Extended F: bias states are random walk (identity block)
+                    F_aug = np.eye(9)
+                    F_aug[:6, :6] = self.F
+                    self.F = F_aug
+        
+                    # Extended H: z = H_vel @ x[:6] + x[6:9]
+                    H_aug = np.zeros((3, 9))
+                    H_aug[:, :6] = self.H
+                    H_aug[:, 6:] = np.eye(3)
+                    self.H = H_aug
+        
+                    # Extended Q: small bias drift
+                    Q_aug = np.zeros((9, 9))
+                    Q_aug[:6, :6] = self.Q
+                    Q_aug[6:, 6:] = np.eye(3) * (0.001 ** 2)   # bias diffuses slowly
+                    self.Q = Q_aug
+        
+                    # Extended P
+                    self.P = np.diag([1,1,1,10,10,10,0.01,0.01,0.01]).astype(np.float64)
+
     # ------------------------------------------------------------------
     def _sigma_points(self):
         """Generate 2n+1 sigma points from current x and P."""
@@ -113,9 +147,20 @@ class UnscentedKalmanFilter:
 
     # ------------------------------------------------------------------
     def reset(self, x0: np.ndarray):
-        self.x = np.array(x0, dtype=np.float64).flatten()
-        assert self.x.shape == (6,)
-        self.P = np.diag([1.0, 1.0, 1.0, 10.0, 10.0, 10.0]).astype(np.float64)
+        x0 = np.array(x0, dtype=np.float64).flatten()
+        assert x0.shape == (6,), f"x0 must be length-6, got {x0.shape}"
+
+        if self.augment_bias:
+            self.x    = np.zeros(9, dtype=np.float64)
+            self.x[:6] = x0
+            # bias initialised to zero — filter learns it online
+            self.P    = np.diag([1.0, 1.0, 1.0,
+                                10.0, 10.0, 10.0,
+                                0.01, 0.01, 0.01]).astype(np.float64)
+        else:
+            self.x = x0.copy()
+            self.P = np.diag([1.0, 1.0, 1.0,
+                            10.0, 10.0, 10.0]).astype(np.float64)
 
     # ------------------------------------------------------------------
     def predict(self):

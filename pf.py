@@ -40,6 +40,7 @@ class ParticleFilter:
             resample_threshold : resample when ESS < threshold * N_particles
         """
         self.dt          = dt
+        self.accel_std = accel_std
         self.N           = N_particles
         self.resamp_thr  = resample_threshold
         self.n_state     = 6
@@ -89,15 +90,14 @@ class ParticleFilter:
 
     # ------------------------------------------------------------------
     def _propagate(self):
-        """Apply F + process noise to all particles."""
-        # F @ particles.T — linear propagation
-        self.particles = (self.F @ self.particles.T).T   # (N, 6)
+        """Apply F + correlated process noise (Wiener kinematic model)."""
+        self.particles = (self.F @ self.particles.T).T
 
-        # Add independent process noise per particle
-        noise = np.random.randn(self.N, 6)
-        noise[:, :3] *= self.q_pos   # position noise
-        noise[:, 3:] *= self.q_vel   # velocity noise
-        self.particles += noise
+        # Sample velocity noise first, then derive correlated position noise
+        # This matches the Wiener model: dp = v*dt + 0.5*a*dt^2, dv = a*dt
+        a_noise = np.random.randn(self.N, 3) * self.accel_std   # acceleration sample
+        self.particles[:, :3] += 0.5 * a_noise * self.dt ** 2   # pos perturbation
+        self.particles[:, 3:] += a_noise * self.dt
 
     # ------------------------------------------------------------------
     def _log_likelihood(self, z: np.ndarray) -> np.ndarray:

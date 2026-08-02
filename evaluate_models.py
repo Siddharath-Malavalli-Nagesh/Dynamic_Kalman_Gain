@@ -32,7 +32,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ekf import ExtendedKalmanFilter
-from ekf_gravity import GravityAwareEKF
+from ukf import UnscentedKalmanFilter
+from pf  import ParticleFilter
 from kalmannet_student import KalmanNetStudent
 import torch.nn.functional as F
 # ──────────────────────────────────────────────
@@ -346,6 +347,91 @@ def _lat_ekf(x_gt: np.ndarray, y_meas: np.ndarray, n_seq: int,
     return float(np.mean(step_times)), float(np.std(step_times))
 
 # ══════════════════════════════════════════════
+# UKF inference and latency
+# ══════════════════════════════════════════════
+
+def _infer_ukf(x_gt: np.ndarray, y_meas: np.ndarray,
+               H_matrix: np.ndarray, H_bias: np.ndarray,
+               sigma_r: np.ndarray, accel_std: float = 0.1) -> np.ndarray:
+    """Returns (N, T-1, 6)."""
+    N, T, _ = x_gt.shape
+    preds   = np.zeros((N, T - 1, 6), dtype=np.float64)
+    for i in range(N):
+        ukf       = UnscentedKalmanFilter(dt=0.01, accel_std=accel_std)
+        ukf.H     = H_matrix
+        ukf.R     = np.diag(sigma_r ** 2)
+        ukf.reset(x_gt[i, 0, :])
+        for t in range(1, T):
+            z = y_meas[i, t, :] - H_bias
+            preds[i, t - 1, :] = ukf.step(z)
+    return preds
+
+
+def _lat_ukf(x_gt: np.ndarray, y_meas: np.ndarray, n_seq: int,
+             H_matrix: np.ndarray, H_bias: np.ndarray,
+             sigma_r: np.ndarray, accel_std: float = 0.1) -> tuple:
+    """Returns (mean_ms, std_ms) for UKF on CPU."""
+    N, T, _    = x_gt.shape
+    n_seq      = min(n_seq, N)
+    step_times = []
+    for i in range(n_seq):
+        ukf       = UnscentedKalmanFilter(dt=0.01, accel_std=accel_std)
+        ukf.H     = H_matrix
+        ukf.R     = np.diag(sigma_r ** 2)
+        ukf.reset(x_gt[i, 0, :])
+        for t in range(1, T):
+            z  = y_meas[i, t, :] - H_bias
+            t0 = time.perf_counter()
+            ukf.step(z)
+            t1 = time.perf_counter()
+            step_times.append((t1 - t0) * 1000.0)
+    return float(np.mean(step_times)), float(np.std(step_times))
+
+
+# ══════════════════════════════════════════════
+# PF inference and latency
+# ══════════════════════════════════════════════
+
+def _infer_pf(x_gt: np.ndarray, y_meas: np.ndarray,
+              H_matrix: np.ndarray, H_bias: np.ndarray,
+              sigma_r: np.ndarray, accel_std: float = 0.1,
+              N_particles: int = 200) -> np.ndarray:
+    """Returns (N, T-1, 6)."""
+    N, T, _ = x_gt.shape
+    preds   = np.zeros((N, T - 1, 6), dtype=np.float64)
+    for i in range(N):
+        pf       = ParticleFilter(dt=0.01, accel_std=accel_std,
+                                   sigma_y=sigma_r, H_matrix=H_matrix,
+                                   N_particles=N_particles)
+        pf.reset(x_gt[i, 0, :])
+        for t in range(1, T):
+            z = y_meas[i, t, :] - H_bias
+            preds[i, t - 1, :] = pf.step(z)
+    return preds
+
+
+def _lat_pf(x_gt: np.ndarray, y_meas: np.ndarray, n_seq: int,
+            H_matrix: np.ndarray, H_bias: np.ndarray,
+            sigma_r: np.ndarray, accel_std: float = 0.1,
+            N_particles: int = 200) -> tuple:
+    """Returns (mean_ms, std_ms) for PF on CPU."""
+    N, T, _    = x_gt.shape
+    n_seq      = min(n_seq, N)
+    step_times = []
+    for i in range(n_seq):
+        pf = ParticleFilter(dt=0.01, accel_std=accel_std,
+                             sigma_y=sigma_r, H_matrix=H_matrix,
+                             N_particles=N_particles)
+        pf.reset(x_gt[i, 0, :])
+        for t in range(1, T):
+            z  = y_meas[i, t, :] - H_bias
+            t0 = time.perf_counter()
+            pf.step(z)
+            t1 = time.perf_counter()
+            step_times.append((t1 - t0) * 1000.0)
+    return float(np.mean(step_times)), float(np.std(step_times))
+
+# ══════════════════════════════════════════════
 # Print helpers
 # ══════════════════════════════════════════════
 
@@ -393,7 +479,7 @@ def _print_comparison(names: list, metrics: list,
     div = "=" * (30 + (W + 1) * NC)
 
     print(f"\n{div}")
-    print("  THREE-WAY COMPARISON TABLE")
+    print("  FIVE-WAY COMPARISON TABLE")
     print(div)
 
     hdr = f"  {'Metric':<28}"
@@ -522,6 +608,10 @@ def main():
     knet_preds    = _infer_torch_batched(knet,    x_np, y_np)
     student_preds = _infer_torch_batched(student, x_np, y_np)
     ekf_preds   = _infer_ekf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std)
+    ukf_preds     = _infer_ukf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std)
+    print("  Running PF (200 particles)...")
+    pf_preds    = _infer_pf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std,
+                               N_particles=200)
     print("  Done.")
 
     # ── Metrics ───────────────────────────────
@@ -529,7 +619,8 @@ def main():
     knet_m  = compute_metrics(knet_preds.astype(np.float64),    gt_eval)
     stu_m   = compute_metrics(student_preds.astype(np.float64), gt_eval)
     ekf_m   = compute_metrics(ekf_preds,   gt_eval)
-
+    ukf_m   = compute_metrics(ukf_preds,    gt_eval)
+    pf_m    = compute_metrics(pf_preds,     gt_eval)
     # ── Step-wise CPU latency ──────────────────
     cpu = torch.device("cpu")
     print(f"\nStep-wise CPU latency ({LATENCY_N_SEQ} seqs)…")
@@ -542,6 +633,15 @@ def main():
 
     print("  Student…")
     stu_cpu_m, stu_cpu_s = _lat_torch(student, x_np, y_np, cpu, LATENCY_N_SEQ)
+
+    print("  UKF...")
+    ukf_cpu_m, ukf_cpu_s = _lat_ukf(x_f64, y_f64, LATENCY_N_SEQ,
+                                      H_fit, H_bias_fit, sigma_r, accel_std)
+
+    print("  PF...")
+    pf_cpu_m, pf_cpu_s   = _lat_pf(x_f64, y_f64, LATENCY_N_SEQ,
+                                     H_fit, H_bias_fit, sigma_r, accel_std,
+                                     N_particles=200)
 
     # Restore to DEVICE after CPU latency pass
     knet.to(DEVICE)
@@ -578,16 +678,23 @@ def main():
     _print_model_results(
         "EKF — Baseline",
         ekf_m, ekf_cpu_m, ekf_cpu_s, -1.0, -1.0)
+    _print_model_results(
+        "UKF — Unscented Kalman Filter",
+        ukf_m, ukf_cpu_m, ukf_cpu_s, -1.0, -1.0)
+
+    _print_model_results(
+        "PF — Particle Filter (N=200)",
+        pf_m, pf_cpu_m, pf_cpu_s, -1.0, -1.0)
 
 
     # ── Three-way comparison table ─────────────
     _print_comparison(
-        names    = ["EKF", "KalmanNet", "Student"],
-        metrics  = [ekf_m, knet_m, stu_m],
-        cpu_means= [ekf_cpu_m, knet_cpu_m, stu_cpu_m],
-        cpu_stds = [ekf_cpu_s, knet_cpu_s, stu_cpu_s],
-        gpu_means= [-1.0, knet_gpu_m, stu_gpu_m],
-        gpu_stds = [-1.0, knet_gpu_s, stu_gpu_s],
+        names    = ["EKF", "UKF", "PF(200)", "KalmanNet", "Student"],
+        metrics  = [ekf_m, ukf_m, pf_m, knet_m, stu_m],
+        cpu_means= [ekf_cpu_m, ukf_cpu_m, pf_cpu_m, knet_cpu_m, stu_cpu_m],
+        cpu_stds = [ekf_cpu_s, ukf_cpu_s, pf_cpu_s, knet_cpu_s, stu_cpu_s],
+        gpu_means= [-1.0,       -1.0,      -1.0,     knet_gpu_m, stu_gpu_m],
+        gpu_stds = [-1.0,       -1.0,      -1.0,     knet_gpu_s, stu_gpu_s],
     )
 
 

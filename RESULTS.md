@@ -1,16 +1,17 @@
-# EKF vs Gravity-Aware EKF vs KalmanNet vs Shadow Student
+# EKF vs KalmanNet vs Shadow Student
 
 ## Overview
 
-This report compares four state estimation methods:
+This report compares three state estimation methods:
 
 - **EKF** (Classical Extended Kalman Filter baseline)
-- **Gravity-Aware EKF** (EKF with gravity compensation)
 - **KalmanNet** (Deep learning teacher model)
 - **Shadow Student** (Distilled lightweight model)
 
 ---
+
 ## Experimental Setup
+
 (CPU Specs)
 
 | Component | Specification |
@@ -18,20 +19,20 @@ This report compares four state estimation methods:
 | CPU Architecture | x86_64 |
 | CPU Frequency | 2803.2 MHz (~2.80 GHz) |
 
+---
+
 # 1. Position Estimation Performance
 
 | Model | MSE (m²) | RMSE (m) | MAE (m) | Inlier Precision (<1m) | % Position Error |
 |------|---------:|---------:|---------:|-----------------------:|----------------:|
-| EKF | 24.173650 | 8.5159 | 8.0030 | 0.02% | 4.9473% |
-| Gravity-Aware EKF | 16.797172 | 7.0987 | 6.2604 | 0.29% | 3.8701% |
+| EKF | 3.178364 | 3.0879 | 2.5117 | 27.56% | 1.5527% |
 | KalmanNet | **0.327682** | **0.9915** | **0.6455** | **79.90%** | **0.3991%** |
 | Shadow Student | 0.592099 | 1.3328 | 0.9164 | 66.66% | 0.5665% |
 
 ### Key Insights
 
-- Gravity-aware EKF improves position RMSE by **16.6%** over the standard EKF.
-- KalmanNet reduces EKF RMSE by **88.4%**.
-- Shadow Student reduces EKF RMSE by **84.4%**.
+- KalmanNet reduces EKF position RMSE by **67.9%**.
+- Shadow Student reduces EKF position RMSE by **56.8%**.
 - KalmanNet achieves nearly **80%** sub-meter precision.
 - Shadow Student maintains **66.7%** sub-meter precision while using a significantly smaller model.
 
@@ -41,17 +42,15 @@ This report compares four state estimation methods:
 
 | Model | x RMSE | y RMSE | z RMSE |
 |------|--------:|--------:|--------:|
-| EKF | 3.2268 | 4.1503 | 6.6995 |
-| Gravity-Aware EKF | 4.1233 | 4.1778 | 3.9920 |
-| KalmanNet | **0.5627** | **0.8060** | **0.1293** |
+| EKF | 1.8958 | 2.4358 | 0.0881 |
+| KalmanNet | **0.5627** | **0.8060** | 0.1293 |
 | Shadow Student | 0.8946 | 0.9403 | 0.3031 |
 
 ### Key Insights
 
-- Standard EKF exhibits large errors across all position axes.
-- Gravity compensation significantly improves the **z-axis**, reducing RMSE from **6.70 m** to **3.99 m**.
-- KalmanNet consistently achieves the lowest error across all axes.
-- Shadow Student remains close to the teacher while using a much smaller architecture.
+- KalmanNet provides the lowest horizontal position error.
+- Shadow Student closely follows the teacher while remaining lightweight.
+- EKF performs competitively on the z-axis but exhibits significantly larger horizontal drift.
 
 ---
 
@@ -59,16 +58,15 @@ This report compares four state estimation methods:
 
 | Model | MSE (m/s)² | RMSE (m/s) | MAE (m/s) |
 |------|-----------:|-----------:|----------:|
-| EKF | 5.894971 | 4.2053 | 3.6389 |
-| Gravity-Aware EKF | 9.056648 | 5.2125 | 4.5445 |
+| EKF | 0.658693 | 1.4057 | 1.3089 |
 | KalmanNet | **0.088549** | **0.5154** | **0.3899** |
 | Shadow Student | 0.199972 | 0.7745 | 0.5923 |
 
 ### Key Insights
 
-- KalmanNet reduces EKF velocity RMSE by **87.7%**.
-- Shadow Student reduces EKF velocity RMSE by **81.6%**.
-- Gravity-aware EKF improves positional accuracy but slightly degrades velocity estimation, indicating that simple gravity compensation alone is insufficient for accurate dynamic modeling.
+- KalmanNet reduces EKF velocity RMSE by **63.3%**.
+- Shadow Student reduces EKF velocity RMSE by **44.9%**.
+- Both neural estimators substantially outperform the classical EKF.
 
 ---
 
@@ -76,16 +74,15 @@ This report compares four state estimation methods:
 
 | Model | vx RMSE | vy RMSE | vz RMSE |
 |------|---------:|---------:|---------:|
-| EKF | 2.5531 | 3.3399 | 0.1081 |
-| Gravity-Aware EKF | 3.6248 | 3.7439 | 0.1180 |
-| KalmanNet | **0.3423** | **0.3747** | **0.0897** |
-| Shadow Student | 0.2991 | 0.6919 | 0.1781 |
+| EKF | 0.8877 | 1.0890 | **0.0444** |
+| KalmanNet | 0.3423 | **0.3747** | 0.0897 |
+| Shadow Student | **0.2991** | 0.6919 | 0.1781 |
 
 ### Key Insights
 
-- EKF exhibits significant instability in the horizontal velocity components.
 - KalmanNet provides the most balanced velocity estimates.
-- Shadow Student preserves strong performance while remaining computationally lightweight.
+- Shadow Student achieves the lowest x-axis velocity RMSE.
+- EKF exhibits larger horizontal velocity errors than the learning-based models.
 
 ---
 
@@ -93,17 +90,15 @@ This report compares four state estimation methods:
 
 | Model | MSE |
 |------|----:|
-| EKF | 15.034311 |
-| Gravity-Aware EKF | 12.926910 |
+| EKF | 1.918528 |
 | KalmanNet | **0.208115** |
 | Shadow Student | 0.396036 |
 
 ### Key Insights
 
-- Gravity-aware EKF lowers full-state error by **14.0%** compared to the baseline EKF.
-- KalmanNet achieves approximately **72×** lower full-state MSE than EKF.
-- Shadow Student achieves approximately **38×** lower full-state MSE than EKF.
-- Shadow Student retains much of the teacher's performance while using a significantly smaller model.
+- KalmanNet achieves approximately **9.2×** lower full-state MSE than EKF.
+- Shadow Student achieves approximately **4.8×** lower full-state MSE than EKF.
+- The distilled model retains much of the teacher's estimation capability while remaining computationally efficient.
 
 ---
 
@@ -111,15 +106,13 @@ This report compares four state estimation methods:
 
 | Model | Mean Latency (ms/step) | Std (ms) |
 |------|-----------------------:|---------:|
-| EKF | **0.0157** | 0.0106 |
-| Gravity-Aware EKF | 0.0161 | 0.0097 |
-| KalmanNet | 0.1052 | 0.0395 |
-| Shadow Student | 0.0738 | 0.0289 |
+| EKF | **0.0161** | 0.0037 |
+| KalmanNet | 0.1134 | 0.2641 |
+| Shadow Student | 0.0793 | 0.0559 |
 
 ### Key Insights
 
 - EKF remains the fastest estimator.
-- Gravity compensation introduces virtually **no computational overhead**.
 - Shadow Student is approximately **30% faster** than KalmanNet.
 - Both neural models comfortably satisfy real-time inference requirements.
 
@@ -131,51 +124,47 @@ This report compares four state estimation methods:
 
 - Fastest model.
 - Lowest computational cost.
-- Weakest estimation accuracy.
-- Large drift in both position and velocity.
-
----
-
-## Gravity-Aware EKF
-
-- Improves positional accuracy over the standard EKF.
-- Reduces full-state error with negligible runtime overhead.
-- Particularly improves vertical position estimation.
-- Velocity estimation remains limited due to the simplified gravity compensation model.
+- Moderate estimation accuracy.
+- Larger position and velocity drift than the learning-based methods.
 
 ---
 
 ## KalmanNet (Teacher Model)
 
-- Best overall accuracy across every evaluation metric.
+- Best overall estimation accuracy.
 - Achieves:
-  - **88% lower position RMSE** than EKF.
-  - **88% lower velocity RMSE** than EKF.
-  - **72× lower full-state MSE** than EKF.
-- Highest computational cost among the evaluated methods.
+  - **67.9% lower position RMSE** than EKF.
+  - **63.3% lower velocity RMSE** than EKF.
+  - **9.2× lower full-state MSE** than EKF.
+- Highest computational cost among the evaluated models.
 
 ---
 
 ## Shadow Student (Distilled Model)
 
-- Maintains most of the teacher's estimation accuracy with substantially fewer parameters.
+- Preserves most of the teacher's estimation accuracy while using substantially fewer parameters.
 - Achieves:
-  - **84% lower position RMSE** than EKF.
-  - **82% lower velocity RMSE** than EKF.
-  - **38× lower full-state MSE** than EKF.
-- Approximately **30% faster** than KalmanNet while preserving strong estimation performance.
+  - **56.8% lower position RMSE** than EKF.
+  - **44.9% lower velocity RMSE** than EKF.
+  - **4.8× lower full-state MSE** than EKF.
+- Approximately **30% faster** than KalmanNet, making it suitable for real-time deployment on resource-constrained robotic platforms.
 
 ---
+
 # Ablation Study
 
 | ALPHA_START | Position RMSE (m) | Velocity RMSE (m/s) | CPU Latency (ms/step) |
-|-------------|-------------------|---------------------|----------------------|
-| 0.50        | 4.7854            | 1.4180              | 0.0726               |
-| 0.85        | 1.7734            | 1.4060              | 0.0679               |
+|-------------|------------------:|--------------------:|----------------------:|
+| 0.50 | 4.7854 | 1.4180 | 0.0726 |
+| 0.85 | 1.7734 | 1.4060 | 0.0679 |
+
+---
 
 # Conclusion
 
-The corrected EKF calibration and the addition of a gravity-aware baseline provide stronger and fairer comparisons against the learning-based approaches. While gravity compensation offers modest improvements to classical filtering with virtually no runtime cost, the neural estimators significantly outperform both EKF variants. KalmanNet delivers the highest overall estimation accuracy, whereas the Shadow Student achieves a favorable balance between computational efficiency and estimation performance, making it well suited for real-time deployment on resource-constrained robotic platforms.
+The updated EKF calibration provides a substantially stronger classical baseline for comparison. Both learning-based estimators significantly outperform the EKF in state estimation accuracy while maintaining real-time inference speed. KalmanNet achieves the highest overall accuracy, whereas the Shadow Student offers an excellent trade-off between computational efficiency and estimation performance, making it well suited for deployment on embedded and resource-constrained robotic platforms.
+
+---
 
 # Shadow Student Learned Observation Matrix
 

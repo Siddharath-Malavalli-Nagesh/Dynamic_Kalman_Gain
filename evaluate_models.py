@@ -226,18 +226,20 @@ def _infer_torch_batched(model: nn.Module, x_np: np.ndarray,
 
 
 def _infer_ekf(x_gt: np.ndarray, y_meas: np.ndarray,
-               H_matrix: np.ndarray, sigma_r: np.ndarray) -> np.ndarray:
-    """Returns (N, T-1, 6)."""
+               H_matrix: np.ndarray, H_bias: np.ndarray,
+               sigma_r: np.ndarray, accel_std: float = 0.5) -> np.ndarray:
+    """Returns (N, T-1, 6). Uses fitted H, bias, residual R, kinematic Q."""
     N, T, _ = x_gt.shape
     preds    = np.zeros((N, T - 1, 6), dtype=np.float64)
 
     for i in range(N):
-        ekf       = ExtendedKalmanFilter(dt=0.01)
-        ekf.H     = H_matrix                          # fitted H
-        ekf.R     = np.diag(sigma_r ** 2)             # residual-based R
+        ekf       = ExtendedKalmanFilter(dt=0.01, accel_std=accel_std)
+        ekf.H     = H_matrix
+        ekf.R     = np.diag(sigma_r ** 2)
         ekf.reset(x_gt[i, 0, :])
         for t in range(1, T):
-            preds[i, t - 1, :] = ekf.step(y_meas[i, t, :])
+            z = y_meas[i, t, :] - H_bias   # subtract per-channel bias before filter
+            preds[i, t - 1, :] = ekf.step(z)
     return preds
 
 
@@ -324,55 +326,25 @@ def _lat_torch(model: nn.Module, x_np: np.ndarray,
 
 
 def _lat_ekf(x_gt: np.ndarray, y_meas: np.ndarray, n_seq: int,
-             H_matrix: np.ndarray, sigma_r: np.ndarray) -> tuple:
+             H_matrix: np.ndarray, H_bias: np.ndarray,
+             sigma_r: np.ndarray, accel_std: float = 0.5) -> tuple:
     """Returns (mean_ms, std_ms) for EKF on CPU."""
     N, T, _    = x_gt.shape
     n_seq      = min(n_seq, N)
     step_times = []
 
     for i in range(n_seq):
-        ekf   = ExtendedKalmanFilter(dt=0.01)
-        ekf.H = H_matrix
-        ekf.R = np.diag(sigma_r ** 2)
+        ekf        = ExtendedKalmanFilter(dt=0.01, accel_std=accel_std)
+        ekf.H      = H_matrix
+        ekf.R      = np.diag(sigma_r ** 2)
         ekf.reset(x_gt[i, 0, :])
         for t in range(1, T):
             t0 = time.perf_counter()
-            ekf.step(y_meas[i, t, :])
+            ekf.step(y_meas[i, t, :] - H_bias)
             t1 = time.perf_counter()
             step_times.append((t1 - t0) * 1000.0)
     return float(np.mean(step_times)), float(np.std(step_times))
-def _infer_ekf_gravity(x_gt: np.ndarray, y_meas: np.ndarray,
-                       H_matrix: np.ndarray, sigma_r: np.ndarray) -> np.ndarray:
-    """Returns (N, T-1, 6). Gravity-aware EKF with fitted H/R."""
-    N, T, _ = x_gt.shape
-    preds   = np.zeros((N, T - 1, 6), dtype=np.float64)
-    for i in range(N):
-        ekf   = GravityAwareEKF(dt=0.01)
-        ekf.H = H_matrix
-        ekf.R = np.diag(sigma_r ** 2)
-        ekf.reset(x_gt[i, 0, :])
-        for t in range(1, T):
-            preds[i, t - 1, :] = ekf.step(y_meas[i, t, :])
-    return preds
 
-
-def _lat_ekf_gravity(x_gt: np.ndarray, y_meas: np.ndarray, n_seq: int,
-                     H_matrix: np.ndarray, sigma_r: np.ndarray) -> tuple:
-    """Returns (mean_ms, std_ms) for gravity-aware EKF on CPU."""
-    N, T, _    = x_gt.shape
-    n_seq      = min(n_seq, N)
-    step_times = []
-    for i in range(n_seq):
-        ekf   = GravityAwareEKF(dt=0.01)
-        ekf.H = H_matrix
-        ekf.R = np.diag(sigma_r ** 2)
-        ekf.reset(x_gt[i, 0, :])
-        for t in range(1, T):
-            t0 = time.perf_counter()
-            ekf.step(y_meas[i, t, :])
-            t1 = time.perf_counter()
-            step_times.append((t1 - t0) * 1000.0)
-    return float(np.mean(step_times)), float(np.std(step_times))
 # ══════════════════════════════════════════════
 # Print helpers
 # ══════════════════════════════════════════════
@@ -484,6 +456,10 @@ def _print_comparison(names: list, metrics: list,
 # ══════════════════════════════════════════════
 
 def main():
+    import inspect
+    from ekf import ExtendedKalmanFilter
+    src = inspect.getsource(ExtendedKalmanFilter.update)
+    print(src[:300])
     # ── Load data ─────────────────────────────
     print(f"Loading: {TEST_DATA}")
     raw     = np.load(TEST_DATA)
@@ -497,19 +473,37 @@ def main():
     y_f64   = y_np.astype(np.float64)
     gt_eval = x_np[:, 1:, :].astype(np.float64)   # (N, T-1, 6)
 
-    print("  Loading training data to fit EKF H/R (train set only)...")
+    print("  Loading training data to fit EKF R and accel_std (train set only)...")
     _tr   = np.load(TRAIN_DATA)
     _tr_x = _sanitize(_tr["x"].astype(np.float32)).astype(np.float64)
     _tr_y = _sanitize(_tr["y"].astype(np.float32)).astype(np.float64)
-    _x_flat = _tr_x[:, 1:, :].reshape(-1, 6)
-    _y_flat = _tr_y[:, 1:, :].reshape(-1, 3)
-    H_fit, _, _, _ = np.linalg.lstsq(_x_flat, _y_flat, rcond=None)
-    H_fit   = H_fit.T.astype(np.float64)
-    _y_pred = (H_fit @ _x_flat.T).T
-    sigma_r = np.std(_y_flat - _y_pred, axis=0)
-    print(f"  Fitted H matrix:\n{np.round(H_fit, 4)}")
+
+    # Use physically correct H: observe velocities (vx, vy, vz)
+    # y[0] ≈ vx, y[1] ≈ vy, y[2] ≈ vz+gravity_bias
+    # This matches the NCLT odometry setup in the KalmanNet paper.
+    H_fit = np.array([
+        [0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 1],
+    ], dtype=np.float64)
+
+    # Fit bias per channel: mean(y - H @ x) over training set
+    _x_flat   = _tr_x[:, 1:, :].reshape(-1, 6)
+    _y_flat   = _tr_y[:, 1:, :].reshape(-1, 3)
+    _y_pred   = (H_fit @ _x_flat.T).T           # (N*T, 3)
+    _residuals = _y_flat - _y_pred
+    H_bias_fit = np.mean(_residuals, axis=0)    # (3,) per-channel bias
+    sigma_r    = np.std(_residuals, axis=0)     # (3,) measurement noise
+
+    # Estimate accel_std from velocity differences
+    _vel_diff = np.diff(_tr_x[:, :, 3:6], axis=1)
+    accel_std = float(np.clip(np.std(_vel_diff), 0.01, 1.0))
+
+    print(f"  H matrix: velocity observer (fixed, physically correct)")
+    print(f"  Fitted H bias: {np.round(H_bias_fit, 4)}")
     print(f"  Residual sigma_r: {np.round(sigma_r, 4)}")
-    del _tr, _tr_x, _tr_y, _x_flat, _y_flat, _y_pred
+    print(f"  Estimated accel_std: {accel_std:.4f} m/s")
+    del _tr, _tr_x, _tr_y, _x_flat, _y_flat, _y_pred, _residuals, _vel_diff
     # ── Load models ───────────────────────────
     print(f"Loading KalmanNet from:  {KNET_WEIGHTS}")
     knet = KalmanNet(m=6, n=3, N_rnn=32).to(DEVICE)
@@ -527,8 +521,7 @@ def main():
     print("\nRunning accuracy inference (batched)…")
     knet_preds    = _infer_torch_batched(knet,    x_np, y_np)
     student_preds = _infer_torch_batched(student, x_np, y_np)
-    ekf_preds   = _infer_ekf(x_f64, y_f64, H_fit, sigma_r)
-    ekf_g_preds = _infer_ekf_gravity(x_f64, y_f64, H_fit, sigma_r)
+    ekf_preds   = _infer_ekf(x_f64, y_f64, H_fit, H_bias_fit, sigma_r, accel_std)
     print("  Done.")
 
     # ── Metrics ───────────────────────────────
@@ -536,17 +529,13 @@ def main():
     knet_m  = compute_metrics(knet_preds.astype(np.float64),    gt_eval)
     stu_m   = compute_metrics(student_preds.astype(np.float64), gt_eval)
     ekf_m   = compute_metrics(ekf_preds,   gt_eval)
-    ekf_g_m = compute_metrics(ekf_g_preds, gt_eval)
 
     # ── Step-wise CPU latency ──────────────────
     cpu = torch.device("cpu")
     print(f"\nStep-wise CPU latency ({LATENCY_N_SEQ} seqs)…")
 
     print("  EKF…")
-    ekf_cpu_m,   ekf_cpu_s   = _lat_ekf(x_f64, y_f64, LATENCY_N_SEQ, H_fit, sigma_r)
-
-    print("  EKF (gravity-aware)…")
-    ekf_g_cpu_m, ekf_g_cpu_s = _lat_ekf_gravity(x_f64, y_f64, LATENCY_N_SEQ, H_fit, sigma_r)
+    ekf_cpu_m,   ekf_cpu_s   = _lat_ekf(x_f64, y_f64, LATENCY_N_SEQ, H_fit, H_bias_fit, sigma_r, accel_std)
 
     print("  KalmanNet…")
     knet_cpu_m, knet_cpu_s = _lat_torch(knet, x_np, y_np, cpu, LATENCY_N_SEQ)
@@ -590,18 +579,15 @@ def main():
         "EKF — Baseline",
         ekf_m, ekf_cpu_m, ekf_cpu_s, -1.0, -1.0)
 
-    _print_model_results(
-        "EKF (Gravity-Aware) — Baseline+",
-        ekf_g_m, ekf_g_cpu_m, ekf_g_cpu_s, -1.0, -1.0)
 
     # ── Three-way comparison table ─────────────
     _print_comparison(
-        names    = ["EKF", "EKF+Grav", "KalmanNet", "Student"],
-        metrics  = [ekf_m, ekf_g_m, knet_m, stu_m],
-        cpu_means= [ekf_cpu_m,   ekf_g_cpu_m, knet_cpu_m, stu_cpu_m],
-        cpu_stds = [ekf_cpu_s,   ekf_g_cpu_s, knet_cpu_s, stu_cpu_s],
-        gpu_means= [-1.0,        -1.0,         knet_gpu_m, stu_gpu_m],
-        gpu_stds = [-1.0,        -1.0,         knet_gpu_s, stu_gpu_s],
+        names    = ["EKF", "KalmanNet", "Student"],
+        metrics  = [ekf_m, knet_m, stu_m],
+        cpu_means= [ekf_cpu_m, knet_cpu_m, stu_cpu_m],
+        cpu_stds = [ekf_cpu_s, knet_cpu_s, stu_cpu_s],
+        gpu_means= [-1.0, knet_gpu_m, stu_gpu_m],
+        gpu_stds = [-1.0, knet_gpu_s, stu_gpu_s],
     )
 
 

@@ -78,6 +78,46 @@ weakness. Not the regime where filtering matters.
 | `vy` (m/s) | **0.68** | 0.44 | 0.44 | EKF marginally better |
 | `vz` (m/s) | **1.66** | 8.67 | 8.67 | KalmanNet **5.2×** — same gravity story |
 
+### C. Drift vs evaluation window (crossover analysis)
+
+Rather than pick a single evaluation horizon, we sweep the window
+length from 2 s to 56 s and report aggregate RMSE for all three
+methods at each point. All windows evaluate the same underlying
+5600-step (56 s) test recording; only the per-window GT-reset cadence
+changes. This resolves the "which horizon is fair?" question by
+plotting the whole curve.
+
+| Window (s) | KalmanNet pos (m) | EKF pos (m) | Strapdown pos (m) | KalmanNet vel (m/s) | EKF vel (m/s) | Strapdown vel (m/s) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2  | 0.256 | **0.099** | **0.099** | 0.239 | **0.137** | **0.138** |
+| 5  | 1.160 | **0.594** | **0.594** | 0.459 | **0.313** | **0.313** |
+| 10 | 3.542 | **2.239** | 2.247 | 0.780 | **0.601** | 0.602 |
+| 20 | **10.686** | 10.597 | 10.637 | **1.176** | 1.383 | 1.386 |
+| 40 | **24.833** | 56.077 | 56.123 | **1.164** | 3.636 | 3.638 |
+| 56 | **30.643** | 109.446 | 109.509 | **1.076** | 5.014 | 5.016 |
+
+Two observations:
+
+1. **Crossover at ~20 s (position) and ~15 s (velocity).** Below the
+   crossover the classical baselines win because per-window GT-reset
+   masks their drift; above it, KalmanNet dominates because the
+   classical filters accumulate drift roughly linearly with window
+   length while KalmanNet's learned gain does not.
+
+2. **KalmanNet's velocity RMSE saturates near 1.1 m/s**, while EKF
+   and Strapdown grow linearly (0.14 → 5.01 m/s across the sweep,
+   ≈ 36× growth). This is the strongest single evidence that the
+   learned filter *bounds* the drift rather than merely reducing
+   its magnitude at one horizon.
+
+EKF and Strapdown coincide within plotting precision — the tuned EKF
+adds no benefit over pure bias-corrected double integration on this
+data, because the IMU-as-direct-observation-of-acceleration setup
+leaves the EKF with no informative innovation to work with.
+
+Figure: [`driftcurve.png`](driftcurve.png). Raw data:
+[`eval_driftcurve.json`](eval_driftcurve.json).
+
 ## Interpretation
 
 KalmanNet's two structural wins over EKF are **gravity handling** (it

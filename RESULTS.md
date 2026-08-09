@@ -131,13 +131,15 @@ This report compares seven state estimation methods:
 
 # 6. Latency Comparison (CPU)
 
-> **The latency values below are intentionally left unchanged.**
-
-| Model | Mean Latency (ms/step) | Std (ms) |
-|------|-----------------------:|---------:|
-| EKF | **0.0161** | 0.0037 |
-| KalmanNet | 0.1134 | 0.2641 |
-| Shadow Student | 0.0793 | 0.0559 |
+Model  | Mean Latency (ms/step)  | Std (ms)
+--- | --- | ---
+EKF  | 0.0159  | 0.0079
+UKF  | 0.0314  | 0.0308
+PF (200)  | 0.0432  | 0.0320
+PF (500)  | 0.0590  | 0.0141
+PF (1000)  | 0.0970  | 0.0296
+KalmanNet  | 0.1084  | 0.2633
+Shadow Student  | 0.0733  | 0.0439
 
 ### Key Insights
 
